@@ -1,0 +1,372 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>P2P WebRTC test (Rust signaling)</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    padding: 16px;
+  }
+  video {
+    width: 48%;
+    background: #d5d5d5;
+    aspect-ratio: 16/9;
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  #log {
+    white-space: pre-wrap;
+    background: #0b1020;
+    color: #d6e4ff;
+    padding: 8px;
+    border-radius: 8px;
+    max-height: 40vh;
+    overflow: auto;
+  }
+</style>
+
+<h2>P2P WebRTC test (Rust signaling)</h2>
+<div class="row">
+  <input id="room" value="abc" />
+  <button onclick="connect()">Connect</button>
+  <button onclick="hangup()">Hang up (bye)</button>
+  <span>Role: <b id="role">—</b></span>
+</div>
+
+<div class="row">
+  <video id="local" playsinline muted></video>
+  <video id="remote" playsinline></video>
+</div>
+
+<div class="row" style="margin-top: 8px; gap: 12px">
+  <button onclick="enableSound()">Enable sound</button>
+  <button onclick="toggleMic()">Mute/Unmute mic</button>
+  <label
+    >Remote volume
+    <input
+      id="vol"
+      type="range"
+      min="0"
+      max="1"
+      step="0.01"
+      value="1"
+      oninput="document.getElementById('remote').volume=this.value"
+    />
+  </label>
+  <label
+    >Delay (ms)
+    <input
+      id="delay"
+      type="range"
+      min="0"
+      max="2000"
+      step="10"
+      value="500"
+      oninput="setDelay(this.value)"
+    />
+    <span id="delayVal">500</span>
+  </label>
+  <label
+    ><input
+      id="delayOn"
+      type="checkbox"
+      checked
+      onchange="toggleDelay(this.checked)"
+    />
+    Use delay
+  </label>
+</div>
+
+<div class="row" style="gap: 12px">
+  <div>
+    Local level
+    <progress id="lvlLocal" max="1" value="0" style="width: 200px"></progress>
+  </div>
+  <div>
+    Remote level
+    <progress id="lvlRemote" max="1" value="0" style="width: 200px"></progress>
+  </div>
+</div>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+  const WS_URL = "ws://localhost:8080/ws";
+  let ws,
+    pc,
+    localStream,
+    role = null;
+
+  const localEl = document.getElementById("local");
+  const remoteEl = document.getElementById("remote");
+  let haveLocalMedia = false;
+
+  // autoplay-friendly
+  localEl.muted = true;
+  localEl.playsInline = true;
+  remoteEl.muted = true;
+  remoteEl.playsInline = true;
+  let pendingIce = []; // ICE we queue until remoteDescription is set
+
+  async function connect() {
+    const roomId = document.getElementById("room").value.trim();
+    if (!roomId) return alert("enter room id");
+
+    // 1) create RTCPeerConnection WITH STUN
+    pc = new RTCPeerConnection({
+      iceServers: [],
+    });
+
+    // 2) get local media BEFORE any chance to offer
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: true,
+      });
+      haveLocalMedia = true;
+    } catch (e) {
+      log("getUserMedia failed:", e.message || e);
+      return;
+    }
+
+    // make a one-track stream for analyser
+    localAnalyser = makeAnalyserFromStream(
+      new MediaStream(localStream.getAudioTracks())
+    );
+    startMeters(); // start the UI loop
+
+    localEl.srcObject = localStream;
+    localEl.play().catch(() => {});
+    localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+
+    // 3) wire RTCPeerConnection events
+    pc.ontrack = (e) => {
+      log(
+        "ontrack",
+        e.track.kind,
+        "streams:",
+        e.streams.map((s) => s.id).join(",")
+      );
+      const remoteStream = e.streams[0];
+      remoteEl.srcObject = remoteStream;
+
+      // build audio pipeline: remote -> (delay?) -> gain -> speakers
+      ensureAudioCtx();
+      remoteSrc = audioCtx.createMediaStreamSource(remoteStream);
+      delayNode = audioCtx.createDelay(5.0); // allow up to 5s delay
+      remoteGain = audioCtx.createGain();
+      remoteGain.gain.value = 1;
+
+      // fork to analyser for the meter
+      remoteAnalyser = audioCtx.createAnalyser();
+      remoteAnalyser.fftSize = 512;
+
+      // connect: source → analyser (for meters) and source → (delay?) → gain → destination
+      remoteSrc.connect(remoteAnalyser);
+      if (useDelay) {
+        remoteSrc
+          .connect(delayNode)
+          .connect(remoteGain)
+          .connect(audioCtx.destination);
+      } else {
+        remoteSrc.connect(remoteGain).connect(audioCtx.destination);
+      }
+
+      // apply initial delay from slider
+      setDelay(document.getElementById("delay").value);
+
+      const p = remoteEl.play();
+      if (p) p.catch((err) => log("remote.play blocked:", err.message));
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) send({ type: "ice", candidate: e.candidate });
+    };
+    pc.onsignalingstatechange = () => log("SIG", pc.signalingState);
+    pc.onicegatheringstatechange = () => log("ICE-G", pc.iceGatheringState);
+    pc.oniceconnectionstatechange = () => log("ICE", pc.iceConnectionState);
+    pc.onconnectionstatechange = () => log("PC", pc.connectionState);
+
+    // 4) open WebSocket and handle signaling
+    ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
+    ws.onopen = () => log("WS OPEN");
+    ws.onclose = (e) => log("WS CLOSE", e.code, e.reason || "");
+    ws.onerror = (e) => log("WS ERROR", e.message || e);
+    ws.onmessage = async (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {
+        return log("drop non-JSON", ev.data, e);
+      }
+
+      if (msg.type === "role") {
+        role = msg.role;
+        document.getElementById("role").textContent = role;
+        log("role =", role);
+        if (role === "host") log("waiting for peer to join (room.ready)...");
+        return;
+      }
+
+      if (msg.type === "room.ready") {
+        if (
+          role === "host" &&
+          pc.signalingState === "stable" &&
+          haveLocalMedia
+        ) {
+          log("peer joined → creating offer");
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          send({ type: "offer", sdp: offer.sdp });
+        }
+        return;
+      }
+
+      if (msg.type === "offer") {
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+        while (pendingIce.length) {
+          await pc.addIceCandidate(pendingIce.shift());
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: "answer", sdp: answer.sdp });
+        log("handled offer → sent answer");
+      } else if (msg.type === "answer") {
+        await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        while (pendingIce.length) {
+          await pc.addIceCandidate(pendingIce.shift());
+        }
+        log("handled answer");
+      } else if (msg.type === "ice") {
+        const c = msg.candidate;
+        if (pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(c);
+          } catch (e) {
+            log("addIceCandidate err", e);
+          }
+        } else {
+          pendingIce.push(c);
+        }
+      } else if (msg.type === "bye") {
+        log("peer said bye → closing");
+        await closePeer("peer-bye");
+      }
+    };
+  }
+  function send(obj) {
+    const s = JSON.stringify(obj);
+    ws?.send(s);
+    log("SEND", s);
+  }
+
+  async function hangup() {
+    send({ type: "bye" });
+    await closePeer("self-bye");
+  }
+
+  async function closePeer(tag) {
+    try {
+      ws?.close();
+    } catch {}
+    ws = null;
+    try {
+      pc?.close();
+    } catch {}
+    pc = null;
+    if (localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
+      localStream = null;
+    }
+    log("closed:", tag);
+  }
+  let audioCtx;
+  let remoteSrc, delayNode, remoteGain;
+  let localAnalyser, remoteAnalyser;
+  let useDelay = true;
+
+  function ensureAudioCtx() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC();
+    }
+  }
+
+  function setDelay(ms) {
+    document.getElementById("delayVal").textContent = ms;
+    if (delayNode) delayNode.delayTime.value = ms / 1000;
+  }
+
+  function toggleDelay(on) {
+    useDelay = on;
+    if (!remoteSrc || !remoteGain) return;
+    // rewire graph
+    try {
+      remoteSrc.disconnect();
+    } catch {}
+    if (on) {
+      remoteSrc
+        .connect(delayNode)
+        .connect(remoteGain)
+        .connect(audioCtx.destination);
+    } else {
+      remoteSrc.connect(remoteGain).connect(audioCtx.destination);
+    }
+  }
+
+  function makeAnalyserFromStream(stream) {
+    ensureAudioCtx();
+    const src = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    return analyser;
+  }
+
+  function rmsFromAnalyser(analyser) {
+    const buf = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = (buf[i] - 128) / 128; // -1..1
+      sum += v * v;
+    }
+    return Math.sqrt(sum / buf.length); // 0..~1
+  }
+
+  function startMeters() {
+    const elL = document.getElementById("lvlLocal");
+    const elR = document.getElementById("lvlRemote");
+    function tick() {
+      if (localAnalyser) elL.value = rmsFromAnalyser(localAnalyser);
+      if (remoteAnalyser) elR.value = rmsFromAnalyser(remoteAnalyser);
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+  function enableSound() {
+    // user gesture to satisfy autoplay; keep <video> muted to avoid double audio
+    ensureAudioCtx();
+    audioCtx.resume();
+    remoteEl.muted = true; // we'll hear the WebAudio path only
+    const p = remoteEl.play();
+    if (p) p.catch(() => {});
+  }
+
+  function toggleMic() {
+    const t = localStream?.getAudioTracks?.()[0];
+    if (!t) return;
+    t.enabled = !t.enabled;
+    log("mic", t.enabled ? "ON" : "OFF");
+  }
+
+  const log = (...a) => {
+    const el = document.getElementById("log");
+    el.textContent += a.join(" ") + "\n";
+    el.scrollTop = el.scrollHeight;
+  };
+</script>
