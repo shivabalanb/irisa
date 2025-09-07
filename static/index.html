@@ -1,0 +1,262 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>P2P WebRTC test (Rust signaling)</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    padding: 16px;
+  }
+  video {
+    width: 48%;
+    background: #d5d5d5;
+    aspect-ratio: 16/9;
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  #log {
+    white-space: pre-wrap;
+    background: #0b1020;
+    color: #d6e4ff;
+    padding: 8px;
+    border-radius: 8px;
+    max-height: 40vh;
+    overflow: auto;
+  }
+</style>
+
+<h2>P2P WebRTC test (Rust signaling)</h2>
+<div class="row">
+  <input id="room" value="abc" />
+  <button onclick="connect()">Connect</button>
+  <button onclick="hangup()">Hang up (bye)</button>
+  <span>Role: <b id="role">—</b></span>
+</div>
+
+<div class="row">
+  <video id="local" playsinline muted></video>
+  <video id="remote" playsinline></video>
+</div>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+  const WS_URL =
+    (location.protocol === "https:" ? "wss://" : "ws://") +
+    location.host +
+    "/ws";
+  let ws,
+    pc,
+    localStream,
+    role = null;
+
+  const localEl = document.getElementById("local");
+  const remoteEl = document.getElementById("remote");
+  let haveLocalMedia = false;
+
+  let pendingIce = [];
+
+  async function connect() {
+    const roomId = document.getElementById("room").value.trim();
+    if (!roomId) return alert("enter room id");
+
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+    });
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      haveLocalMedia = true;
+    } catch (e) {
+      log("getUserMedia failed:", e.message || e);
+      return;
+    }
+
+    localEl.srcObject = localStream;
+    localEl.play().catch(() => {});
+
+    // Add tracks to peer connection (this sends your audio/video to remote)
+    localStream.getTracks().forEach((t) => {
+      pc.addTrack(t, localStream);
+      log(`Added ${t.kind} track to peer connection`);
+    });
+
+    pc.ontrack = (e) => {
+      log("received remote track");
+
+      // Handle all streams (in case there are multiple)
+      e.streams.forEach((stream, index) => {
+        log(
+          `Received stream ${index} with ${stream.getTracks().length} tracks`
+        );
+        stream.getTracks().forEach((t) => {
+          log(`  - ${t.kind} track: ${t.label || "unnamed"}`);
+        });
+      });
+
+      // Use the first stream for the remote video element
+      if (e.streams[0]) {
+        const stream = e.streams[0];
+        remoteEl.srcObject = stream;
+
+        // Check if stream has audio
+        const audioTracks = stream.getAudioTracks();
+        const videoTracks = stream.getVideoTracks();
+
+        log(
+          `Stream has ${audioTracks.length} audio track(s) and ${videoTracks.length} video track(s)`
+        );
+
+        if (audioTracks.length > 0) {
+          log("✅ Remote audio will play through video element");
+        } else {
+          log("⚠️ No audio tracks in remote stream");
+        }
+
+        const p = remoteEl.play();
+        if (p) {
+          p.then(() => {
+            log("remote video+audio playing successfully");
+          }).catch((err) => {
+            log("remote.play blocked:", err.message);
+          });
+        }
+      }
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) send({ type: "ice", candidate: e.candidate });
+    };
+
+    // Monitor connection state
+    pc.onconnectionstatechange = () => {
+      log(`Connection state: ${pc.connectionState}`);
+      if (pc.connectionState === "connected") {
+        log("✅ Two-way communication established!");
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE connection state: ${pc.iceConnectionState}`);
+    };
+
+    ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
+    ws.onopen = () => log("WebSocket OPEN");
+    ws.onclose = (e) => log("WebSocket CLOSE", e.code, e.reason || "");
+    ws.onerror = (e) => log("WebSocket ERROR", e.message || e);
+    ws.onmessage = async (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {
+        return log("drop non-JSON", ev.data, e);
+      }
+
+      if (msg.type === "role") {
+        role = msg.role;
+        document.getElementById("role").textContent = role;
+        if (role === "host") log("waiting for peer to join (room.ready)...");
+        return;
+      }
+
+      if (role === "host" && msg.type === "room" && msg.status === "ready") {
+        if (pc.signalingState === "stable" && haveLocalMedia) {
+          log("room ready → creating offer");
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          send({ type: "offer", sdp: offer.sdp });
+        }
+        return;
+      }
+
+      if (msg.type === "offer") {
+        log("received offer → sent answer");
+
+        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+        while (pendingIce.length) {
+          await pc.addIceCandidate(pendingIce.shift());
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: "answer", sdp: answer.sdp });
+      } else if (msg.type === "answer") {
+        log("received answer");
+
+        await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+        while (pendingIce.length) {
+          await pc.addIceCandidate(pendingIce.shift());
+        }
+      } else if (msg.type === "ice") {
+        log("received ice candidate", msg.candidate);
+
+        const c = msg.candidate;
+        if (pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(c);
+          } catch (e) {
+            log("addIceCandidate err", e);
+          }
+        } else {
+          pendingIce.push(c);
+        }
+      } else if (msg.type === "bye") {
+        log("peer said bye → closing");
+        await cleanup("peer-bye");
+      }
+    };
+  }
+  function send(obj) {
+    const s = JSON.stringify(obj);
+    ws?.send(s);
+    log("SEND", s);
+  }
+
+  async function hangup() {
+    send({ type: "bye" });
+    await cleanup("self-bye");
+  }
+
+  async function cleanup(tag) {
+    try {
+      ws?.close();
+    } catch {}
+    ws = null;
+    try {
+      pc?.close();
+    } catch {}
+    pc = null;
+    if (localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
+      localStream = null;
+    }
+    log("cleanup complete:", tag);
+  }
+
+  // function enableRemoteAudio() {
+  //   if (remoteEl.srcObject) {
+  //     log("User tapped remote video - enabling audio");
+  //     remoteEl.muted = false;
+  //     remoteEl
+  //       .play()
+  //       .then(() => {
+  //         log("Remote audio enabled successfully");
+  //       })
+  //       .catch((err) => {
+  //         log("Still can't play audio:", err.message);
+  //       });
+  //   }
+  // }
+
+  const log = (...a) => {
+    const el = document.getElementById("log");
+    el.textContent += a.join(" ") + "\n";
+    el.scrollTop = el.scrollHeight;
+  };
+</script>

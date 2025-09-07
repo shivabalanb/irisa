@@ -7,6 +7,7 @@ use axum::{
         ws::{CloseFrame, close_code},
     },
     http::StatusCode,
+    response::Html,
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -18,10 +19,9 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use uuid::Uuid;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber;
-
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -58,6 +58,7 @@ async fn main() {
     let rooms: Rooms = Arc::new(RwLock::new(HashMap::new()));
 
     let app = Router::new()
+        .route("/", get(index)) // serve your page
         .route("/ok", get(|| async { "ok" }))
         .route("/rooms", post(create_room))
         .route("/rooms/{id}", get(get_room))
@@ -105,6 +106,10 @@ async fn get_room(
     return (code, Json(RoomInfo { exists }));
 }
 
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../static/index.html"))
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(q): Query<WsParams>,
@@ -121,24 +126,31 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
     let (role_opt, ready_targets): (Option<String>, Vec<PeerTx>) = {
         let mut guard = rooms.write().await;
         let room = guard.entry(room_id.clone()).or_default();
-    
+
         // If already full, signal "reject" (handle after we release the lock)
         if room.peers.len() >= 2 {
             (None, Vec::new())
         } else {
             // Add this peer
             room.peers.push((peer_id.clone(), peer_tx.clone()));
-    
+
             // Role is based on new length
-            let role = if room.peers.len() == 1 { "host".to_string() } else { "guest".to_string() };
-    
+            let role = if room.peers.len() == 1 {
+                "host".to_string()
+            } else {
+                "guest".to_string()
+            };
+
             // If this made the room reach 2 peers, notify both peers that the room is ready
             let ready_targets = if room.peers.len() == 2 {
-                room.peers.iter().map(|(_, tx)| tx.clone()).collect()
+                room.peers
+                    .iter()
+                    .map(|(_, peer_tx)| peer_tx.clone())
+                    .collect()
             } else {
                 Vec::new()
             };
-    
+
             (Some(role), ready_targets)
         }
     };
@@ -163,16 +175,14 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
         .await
         .is_err()
     {
-        // client vanished; let cleanup handle it
         return;
     }
     info!(%peer_id, %room_id, %role, "peer joined");
 
-
-    for tx in ready_targets {
-        let _ = tx.send(r#"{"type":"room.ready"}"#.to_string());
+    let ready_msg = serde_json::json!({ "type": "room", "status": "ready" });
+    for peer_tx in ready_targets {
+        let _ = peer_tx.send(ready_msg.to_string());
     }
-
 
     let rooms_fwd = rooms.clone();
     let room_id_fwd = room_id.clone();
@@ -188,7 +198,6 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
                         break;
                     }
                     Ok(_valid) => {
-
                         let targets: Vec<UnboundedSender<String>> = {
                             let rooms_map = rooms_fwd.read().await;
                             if let Some(room) = rooms_map.get(&room_id_fwd) {
@@ -211,9 +220,11 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
                 },
                 Message::Close(_f) => {
                     info!(%peer_id_fwd, %room_id_fwd, ?_f, "client sent WS Close");
-                    break},
-                _ => {                    info!(%peer_id_fwd, %room_id_fwd, "ignoring non-text");
-            }
+                    break;
+                }
+                _ => {
+                    info!(%peer_id_fwd, %room_id_fwd, "ignoring non-text");
+                }
             }
         }
     });
