@@ -43,8 +43,8 @@ struct Room {
 
 type Rooms = Arc<RwLock<HashMap<String, Room>>>;
 
-#[derive(Deserialize)]
-struct WsParams {
+#[derive(Serialize, Deserialize)]
+struct RoomId {
     roomId: String,
 }
 
@@ -52,7 +52,6 @@ type PeerTx = mpsc::UnboundedSender<String>;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt().init();
 
     let rooms: Rooms = Arc::new(RwLock::new(HashMap::new()));
@@ -60,9 +59,9 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index)) // serve your page
         .route("/ok", get(|| async { "ok" }))
-        .route("/rooms", post(create_room))
-        .route("/rooms/{id}", get(get_room))
         .route("/ws", get(ws_handler))
+        // .route("/rooms", post(create_room))
+        // .route("/rooms/{id}", get(get_room))
         .with_state(rooms);
 
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -72,47 +71,13 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-#[derive(Serialize)]
-struct RoomRes {
-    roomId: String,
-}
-
-async fn create_room(rooms: State<Rooms>) -> (StatusCode, Json<RoomRes>) {
-    let id = Uuid::new_v4().to_string();
-    {
-        let mut table = rooms.write().await;
-        table.insert(id.clone(), Room::default());
-    }
-    let body = RoomRes { roomId: id };
-    (StatusCode::CREATED, Json(body))
-}
-
-#[derive(Serialize)]
-struct RoomInfo {
-    exists: bool,
-}
-
-async fn get_room(
-    State(rooms): State<Rooms>,
-    Path(id): Path<String>,
-) -> (StatusCode, Json<RoomInfo>) {
-    let table = rooms.read().await;
-    let exists = table.contains_key(&id);
-    let code = if exists {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    };
-    return (code, Json(RoomInfo { exists }));
-}
-
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(q): Query<WsParams>,
+    Query(q): Query<RoomId>,
     State(rooms): State<Rooms>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, rooms, q.roomId))
@@ -194,7 +159,24 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
             match msg {
                 Message::Text(txt) => match serde_json::from_str::<ClientMessage>(&txt) {
                     Ok(ClientMessage::Bye) => {
-                        info!(%peer_id_fwd, %room_id_fwd, "got BYE → will close");
+                        info!(%peer_id_fwd, %room_id_fwd, "got BYE → forwarding and closing");
+
+                        let targets: Vec<UnboundedSender<String>> = {
+                            let rooms_map = rooms_fwd.read().await;
+                            if let Some(room) = rooms_map.get(&room_id_fwd) {
+                                room.peers
+                                    .iter()
+                                    .filter(|(pid, _)| pid != &peer_id_fwd)
+                                    .map(|(_, tx)| tx.clone())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        for other_peer_tx in targets {
+                            let _ = other_peer_tx.send(txt.to_string());
+                        }
+
                         break;
                     }
                     Ok(_valid) => {
@@ -249,16 +231,46 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
         }
     }
 
-    // Cleanup: Remove this peer from the room and delete room if empty
-    let mut guard = rooms.write().await;
-    if let Some(room) = guard.get_mut(&room_id) {
-        // Remove this peer from the room
-        room.peers
-            .retain(|(pid, tx)| pid != &peer_id && !tx.is_closed());
-
-        // Delete the room if no peers remain
-        if room.peers.is_empty() {
-            guard.remove(&room_id);
+    {
+        let mut guard = rooms.write().await;
+        if let Some(room) = guard.get_mut(&room_id) {
+            // Delete the room if no peers remain
+            if room.peers.is_empty() {
+                guard.remove(&room_id);
+            } else {
+                // Remove this peer from the room
+                room.peers
+                    .retain(|(pid, tx)| pid != &peer_id && !tx.is_closed());
+            }
         }
     }
 }
+
+// async fn create_room(rooms: State<Rooms>) -> (StatusCode, Json<RoomId>) {
+//     let id = Uuid::new_v4().to_string();
+//     {
+//         let mut table = rooms.write().await;
+//         table.insert(id.clone(), Room::default());
+//     }
+//     let body = RoomId { roomId: id };
+//     (StatusCode::CREATED, Json(body))
+// }
+
+// #[derive(Serialize)]
+// struct RoomInfo {
+//     exists: bool,
+// }
+
+// async fn get_room(
+//     State(rooms): State<Rooms>,
+//     Path(id): Path<String>,
+// ) -> (StatusCode, Json<RoomInfo>) {
+//     let table = rooms.read().await;
+//     let exists = table.contains_key(&id);
+//     let code = if exists {
+//         StatusCode::OK
+//     } else {
+//         StatusCode::NOT_FOUND
+//     };
+//     return (code, Json(RoomInfo { exists }));
+// }

@@ -33,6 +33,7 @@
   <input id="room" value="abc" />
   <button onclick="connect()">Connect</button>
   <button onclick="hangup()">Hang up (bye)</button>
+  <button id="muteBtn" onclick="toggleMute()" disabled>Mute Audio</button>
   <span>Role: <b id="role">—</b></span>
 </div>
 
@@ -53,20 +54,18 @@
     pc,
     localStream,
     role = null;
+  let haveLocalMedia = false;
+  let pendingIce = [];
+  let isMuted = false;
 
   const localEl = document.getElementById("local");
   const remoteEl = document.getElementById("remote");
-  let haveLocalMedia = false;
-
-  let pendingIce = [];
 
   async function connect() {
     const roomId = document.getElementById("room").value.trim();
     if (!roomId) return alert("enter room id");
 
-    pc = new RTCPeerConnection({
-      iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
-    });
+    pc = new RTCPeerConnection();
 
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
@@ -80,53 +79,35 @@
     }
 
     localEl.srcObject = localStream;
+    localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
     localEl.play().catch(() => {});
 
-    // Add tracks to peer connection (this sends your audio/video to remote)
+    // Enable mute button
+    document.getElementById("muteBtn").disabled = false;
+
     localStream.getTracks().forEach((t) => {
       pc.addTrack(t, localStream);
-      log(`Added ${t.kind} track to peer connection`);
+      log(`added track ${t.label} ${t.kind}`);
     });
 
-    pc.ontrack = (e) => {
-      log("received remote track");
-
-      // Handle all streams (in case there are multiple)
-      e.streams.forEach((stream, index) => {
-        log(
-          `Received stream ${index} with ${stream.getTracks().length} tracks`
-        );
-        stream.getTracks().forEach((t) => {
-          log(`  - ${t.kind} track: ${t.label || "unnamed"}`);
-        });
-      });
-
-      // Use the first stream for the remote video element
+    pc.ontrack = async (e) => {
       if (e.streams[0]) {
         const stream = e.streams[0];
         remoteEl.srcObject = stream;
-
-        // Check if stream has audio
         const audioTracks = stream.getAudioTracks();
         const videoTracks = stream.getVideoTracks();
 
-        log(
-          `Stream has ${audioTracks.length} audio track(s) and ${videoTracks.length} video track(s)`
-        );
+        log(`received remote stream with ${stream.getTracks().length} tracks`);
 
-        if (audioTracks.length > 0) {
-          log("✅ Remote audio will play through video element");
-        } else {
-          log("⚠️ No audio tracks in remote stream");
-        }
+        stream.getTracks().forEach((t) => {
+          log(`received track ${t.label} ${t.kind}`);
+        });
 
-        const p = remoteEl.play();
-        if (p) {
-          p.then(() => {
-            log("remote video+audio playing successfully");
-          }).catch((err) => {
-            log("remote.play blocked:", err.message);
-          });
+        try {
+          await remoteEl.play();
+          log("remote video+audio playing successfully");
+        } catch (err) {
+          log("remote.play blocked:", err.message);
         }
       }
     };
@@ -137,20 +118,16 @@
 
     // Monitor connection state
     pc.onconnectionstatechange = () => {
-      log(`Connection state: ${pc.connectionState}`);
+      log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
         log("✅ Two-way communication established!");
       }
     };
 
-    pc.oniceconnectionstatechange = () => {
-      log(`ICE connection state: ${pc.iceConnectionState}`);
-    };
-
     ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
-    ws.onopen = () => log("WebSocket OPEN");
-    ws.onclose = (e) => log("WebSocket CLOSE", e.code, e.reason || "");
-    ws.onerror = (e) => log("WebSocket ERROR", e.message || e);
+    ws.onopen = () => log("[WebSocket] open");
+    ws.onclose = (e) => log("[WebSocket] close", e.code, e.reason || "");
+    ws.onerror = (e) => log("[WebSocket] error", e.message || e);
     ws.onmessage = async (ev) => {
       let msg;
       try {
@@ -212,15 +189,28 @@
       }
     };
   }
-  function send(obj) {
-    const s = JSON.stringify(obj);
-    ws?.send(s);
-    log("SEND", s);
-  }
 
   async function hangup() {
     send({ type: "bye" });
     await cleanup("self-bye");
+  }
+
+  function toggleMute() {
+    if (!localStream) return;
+
+    const audioTracks = localStream.getAudioTracks();
+    if (audioTracks.length > 0) {
+      isMuted = !isMuted;
+      audioTracks[0].enabled = !isMuted; // false = muted, true = unmuted
+
+      const muteBtn = document.getElementById("muteBtn");
+      muteBtn.textContent = isMuted ? "Unmute Audio" : "Mute Audio";
+      log(
+        isMuted
+          ? "Audio muted (local + remote)"
+          : "Audio unmuted (local + remote)"
+      );
+    }
   }
 
   async function cleanup(tag) {
@@ -228,31 +218,45 @@
       ws?.close();
     } catch {}
     ws = null;
+
     try {
       pc?.close();
     } catch {}
     pc = null;
-    if (localStream) {
-      localStream.getTracks().forEach((t) => t.stop());
-      localStream = null;
-    }
+
+    // Stop and clear local media
+    // if (localStream) {
+    //   localStream.getTracks().forEach((t) => t.stop());
+    //   localStream = null;
+    // }
+
+    // Clear video elements
+    // localEl.srcObject = null;
+    remoteEl.srcObject = null;
+
+    // Reset state variables
+    // haveLocalMedia = false;
+    role = null;
+    pendingIce = [];
+
+    // Reset UI
+    document.getElementById("role").textContent = "—";
+    document.getElementById("muteBtn").disabled = true;
+    document.getElementById("muteBtn").textContent = "Mute Audio";
+    isMuted = false;
+
     log("cleanup complete:", tag);
   }
 
-  // function enableRemoteAudio() {
-  //   if (remoteEl.srcObject) {
-  //     log("User tapped remote video - enabling audio");
-  //     remoteEl.muted = false;
-  //     remoteEl
-  //       .play()
-  //       .then(() => {
-  //         log("Remote audio enabled successfully");
-  //       })
-  //       .catch((err) => {
-  //         log("Still can't play audio:", err.message);
-  //       });
-  //   }
-  // }
+  function send(obj) {
+    const s = JSON.stringify(obj);
+    ws?.send(s);
+    if (obj.sdp === undefined) {
+      log("[send]", s);
+    } else {
+      log("[send]", obj.type);
+    }
+  }
 
   const log = (...a) => {
     const el = document.getElementById("log");
