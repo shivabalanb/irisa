@@ -34,12 +34,26 @@
   <button onclick="connect()">Connect</button>
   <button onclick="hangup()">Hang up (bye)</button>
   <button id="muteBtn" onclick="toggleMute()" disabled>Mute Audio</button>
+  <button onclick="getConnectionStats()">Refresh Stats</button>
   <span>Role: <b id="role">—</b></span>
 </div>
 
 <div class="row">
   <video id="local" playsinline muted></video>
   <video id="remote" playsinline></video>
+</div>
+
+<h3>ICE Candidates</h3>
+<div id="iceInfo">
+  <div>
+    <strong>Connection Type:</strong> <span id="connectionType">—</span>
+  </div>
+  <div>
+    <strong>Active Candidate:</strong> <span id="activeCandidate">—</span>
+  </div>
+  <div>
+    <strong>Total Candidates:</strong> <span id="candidateCount">0</span>
+  </div>
 </div>
 
 <h3>Log</h3>
@@ -57,6 +71,8 @@
   let haveLocalMedia = false;
   let pendingIce = [];
   let isMuted = false;
+  let iceCandidates = [];
+  let activeCandidate = null;
 
   const localEl = document.getElementById("local");
   const remoteEl = document.getElementById("remote");
@@ -65,7 +81,64 @@
     const roomId = document.getElementById("room").value.trim();
     if (!roomId) return alert("enter room id");
 
-    pc = new RTCPeerConnection();
+    // Reset ICE info
+    iceCandidates = [];
+    activeCandidate = null;
+    document.getElementById("connectionType").textContent = "—";
+    document.getElementById("activeCandidate").textContent = "—";
+    document.getElementById("candidateCount").textContent = "0";
+
+    // Get TURN server credentials dynamically using Metered.ca API
+    let iceServers = [
+      // STUN servers for NAT traversal (comment out for TURN-only testing)
+      // { urls: "stun:stun.l.google.com:19302" },
+      // { urls: "stun:stun1.l.google.com:19302" },
+    ];
+
+    // Try to get dynamic TURN servers from Metered.ca API
+    try {
+      const response = await fetch(
+        "https://irisa.metered.live/api/v1/turn/credentials?apiKey=6437b90b4a436acebe12a1533600f6eb021f"
+      );
+
+      const dynamicIceServers = await response.json();
+      log(
+        "🔍 API returned servers:",
+        JSON.stringify(dynamicIceServers, null, 2)
+      );
+
+      // Use all servers from API (both STUN and TURN)
+      iceServers = [...iceServers, ...dynamicIceServers];
+      log(`🔍 Added ${dynamicIceServers.length} servers from API`);
+    } catch (e) {
+      log("⚠️ Failed to fetch dynamic TURN servers:", e.message);
+      log("🔄 Falling back to static TURN servers");
+
+      // Fallback to static TURN servers
+      iceServers.push(
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443?transport=tcp",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        }
+      );
+    }
+
+    log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
+    pc = new RTCPeerConnection({
+      iceServers: iceServers,
+      iceCandidatePoolSize: 5, // Pre-gather ICE candidates for faster connection
+    });
 
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
@@ -113,7 +186,28 @@
     };
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) send({ type: "ice", candidate: e.candidate });
+      if (e.candidate) {
+        // Track ICE candidates
+        iceCandidates.push({
+          type: e.candidate.type,
+          protocol: e.candidate.protocol,
+          address: e.candidate.address,
+          port: e.candidate.port,
+          candidateType: e.candidate.candidateType || e.candidate.type,
+        });
+
+        // Update UI
+        updateIceInfo();
+
+        // Log candidate
+        log(
+          `ICE candidate: ${e.candidate.type} ${e.candidate.protocol} ${e.candidate.address}:${e.candidate.port}`
+        );
+
+        send({ type: "ice", candidate: e.candidate });
+      } else {
+        log("ICE gathering complete");
+      }
     };
 
     // Monitor connection state
@@ -121,6 +215,16 @@
       log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
         log("✅ Two-way communication established!");
+        // Get connection stats to see which candidate is being used
+        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
+      }
+    };
+
+    // Monitor ICE connection state
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE connection state: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === "connected") {
+        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
       }
     };
 
@@ -255,6 +359,120 @@
       log("[send]", s);
     } else {
       log("[send]", obj.type);
+    }
+  }
+
+  function updateIceInfo() {
+    document.getElementById("candidateCount").textContent =
+      iceCandidates.length;
+  }
+
+  async function getConnectionStats() {
+    try {
+      const stats = await pc.getStats();
+      let connectionType = "Unknown";
+      let activeCandidateInfo = "Unknown";
+
+      // First, collect all individual candidate reports
+      const candidateReports = new Map();
+      let totalCandidatesCount = 0;
+
+      stats.forEach((report) => {
+        if (
+          report.type === "local-candidate" ||
+          report.type === "remote-candidate"
+        ) {
+          candidateReports.set(report.id, report);
+          totalCandidatesCount++;
+        }
+      });
+
+      // Update total candidates count in UI
+      document.getElementById("candidateCount").textContent =
+        totalCandidatesCount;
+
+      // Log all candidate reports to see what we have
+      log(`🔍 Found ${totalCandidatesCount} individual candidate reports:`);
+      candidateReports.forEach((candidate, id) => {
+        log(
+          `   ${id}: ${candidate.candidateType} ${candidate.address}:${candidate.port}`
+        );
+      });
+
+      stats.forEach((report) => {
+        if (report.type === "candidate-pair" && report.state === "succeeded") {
+          log(`🔍 Found succeeded candidate pair: ${report.id}`);
+          log(`   Local candidate ID: ${report.localCandidateId}`);
+          log(`   Remote candidate ID: ${report.remoteCandidateId}`);
+
+          // Look up the actual candidate objects from our map
+          const localCandidate = candidateReports.get(report.localCandidateId);
+          const remoteCandidate = candidateReports.get(
+            report.remoteCandidateId
+          );
+
+          let localType = "unknown";
+          let remoteType = "unknown";
+
+          if (localCandidate) {
+            localType = localCandidate.candidateType || "unknown";
+            log(
+              `   Local candidate: ${localType} ${localCandidate.address}:${localCandidate.port}`
+            );
+          } else {
+            log(`   ❌ Local candidate not found: ${report.localCandidateId}`);
+          }
+
+          if (remoteCandidate) {
+            remoteType = remoteCandidate.candidateType || "unknown";
+            log(
+              `   Remote candidate: ${remoteType} ${remoteCandidate.address}:${remoteCandidate.port}`
+            );
+          } else {
+            log(
+              `   ❌ Remote candidate not found: ${report.remoteCandidateId}`
+            );
+          }
+
+          log(`✅ Extracted - Local: ${localType}, Remote: ${remoteType}`);
+
+          // Determine connection type based on the combination
+          if (localType === "relay" || remoteType === "relay") {
+            connectionType = "🔄 TURN Relay";
+          } else if (localType === "host" && remoteType === "host") {
+            connectionType = "🏠 Direct (Local)";
+          } else if (
+            localType === "srflx" ||
+            remoteType === "srflx" ||
+            localType === "prflx" ||
+            remoteType === "prflx"
+          ) {
+            connectionType = "🌐 STUN (Public IP)";
+          } else {
+            connectionType = "🔗 Mixed Connection";
+          }
+
+          activeCandidateInfo = `${localType} ↔ ${remoteType}`;
+          activeCandidate = {
+            local: localType,
+            remote: remoteType,
+            address: localCandidate?.address || "Unknown",
+          };
+        }
+      });
+
+      // Update UI
+      document.getElementById("connectionType").textContent = connectionType;
+      document.getElementById("activeCandidate").textContent =
+        activeCandidateInfo;
+
+      log(`📊 Connection: ${connectionType} (${activeCandidateInfo})`);
+
+      // Also update the global variables for other functions
+      window.currentConnectionType = connectionType;
+      window.currentActiveCandidate = activeCandidateInfo;
+    } catch (e) {
+      log("Failed to get connection stats:", e.message);
     }
   }
 
