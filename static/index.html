@@ -32,7 +32,7 @@
 <div class="row">
   <input id="room" value="abc" />
   <button onclick="connect()">Connect</button>
-  <button onclick="hangup()">Hang up (bye)</button>
+  <button onclick="bye()">Bye</button>
   <button id="muteBtn" onclick="toggleMute()" disabled>Mute Audio</button>
   <button onclick="getConnectionStats()">Refresh Stats</button>
   <span>Role: <b id="role">—</b></span>
@@ -77,17 +77,79 @@
   const localEl = document.getElementById("local");
   const remoteEl = document.getElementById("remote");
 
-  async function connect() {
-    const roomId = document.getElementById("room").value.trim();
-    if (!roomId) return alert("enter room id");
+  function setupWebRTCHandlers() {
+    pc.ontrack = async (e) => {
+      if (e.streams[0]) {
+        const stream = e.streams[0];
+        remoteEl.srcObject = stream;
+        const audioTracks = stream.getAudioTracks();
+        const videoTracks = stream.getVideoTracks();
 
-    // Reset ICE info
-    iceCandidates = [];
-    activeCandidate = null;
-    document.getElementById("connectionType").textContent = "—";
-    document.getElementById("activeCandidate").textContent = "—";
-    document.getElementById("candidateCount").textContent = "0";
+        log(`received remote stream with ${stream.getTracks().length} tracks`);
 
+        stream.getTracks().forEach((t) => {
+          log(`received track ${t.label} ${t.kind}`);
+        });
+
+        try {
+          await remoteEl.play();
+          log("✅ remote video+audio playing successfully");
+        } catch (err) {
+          log("❌ remote.play blocked:", err.message);
+          log("💡 Click anywhere to start video");
+
+          // Add click handler to play video
+          const playVideo = async () => {
+            try {
+              await remoteEl.play();
+              log("✅ Remote video playing after user interaction");
+            } catch (e) {
+              log("❌ Still blocked after user interaction:", e.message);
+            }
+          };
+
+          document.addEventListener("click", playVideo, { once: true });
+        }
+      }
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        // Track ICE candidates
+        iceCandidates.push({
+          type: e.candidate.type,
+          protocol: e.candidate.protocol,
+          address: e.candidate.address,
+          port: e.candidate.port,
+          candidateType: e.candidate.candidateType || e.candidate.type,
+        });
+
+        // Update UI
+        updateIceInfo();
+
+        // Log candidate
+        // log(
+        //   `ICE candidate: ${e.candidate.type} ${e.candidate.protocol} ${e.candidate.address}:${e.candidate.port}`
+        // );
+
+        send({ type: "ice", candidate: e.candidate });
+      } else {
+        log("ICE gathering complete");
+      }
+    };
+
+    // Monitor connection state
+    pc.onconnectionstatechange = () => {
+      log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
+      if (pc.connectionState === "connected") {
+        log("✅ Two-way communication established!");
+        // Get connection stats to see which candidate is being used
+        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
+      }
+    };
+  }
+
+  async function fetchIceServers() {
     // Get TURN server credentials dynamically using Metered.ca API
     let iceServers = [
       // STUN servers for NAT traversal (comment out for TURN-only testing)
@@ -100,16 +162,10 @@
       const response = await fetch(
         "https://irisa.metered.live/api/v1/turn/credentials?apiKey=6437b90b4a436acebe12a1533600f6eb021f"
       );
-
       const dynamicIceServers = await response.json();
-      log(
-        "🔍 API returned servers:",
-        JSON.stringify(dynamicIceServers, null, 2)
-      );
 
       // Use all servers from API (both STUN and TURN)
       iceServers = [...iceServers, ...dynamicIceServers];
-      log(`🔍 Added ${dynamicIceServers.length} servers from API`);
     } catch (e) {
       log("⚠️ Failed to fetch dynamic TURN servers:", e.message);
       log("🔄 Falling back to static TURN servers");
@@ -130,11 +186,34 @@
           urls: "turn:openrelay.metered.ca:443?transport=tcp",
           username: "openrelayproject",
           credential: "openrelayproject",
+        },
+        {
+          urls: "turn:relay1.expressturn.com:3480",
+          username: "efPU52K4SLOQ34W2QY",
+          credential: "1TJPNFxHKXrZfelz",
         }
       );
     }
 
-    log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
+    return iceServers;
+  }
+
+  async function connect() {
+    const roomId = document.getElementById("room").value.trim();
+    if (!roomId) return alert("enter room id");
+
+    // Reset ICE info
+    iceCandidates = [];
+    activeCandidate = null;
+    document.getElementById("connectionType").textContent = "—";
+    document.getElementById("activeCandidate").textContent = "—";
+    document.getElementById("candidateCount").textContent = "0";
+    // Enable mute button
+    document.getElementById("muteBtn").disabled = false;
+
+    let iceServers = await fetchIceServers();
+
+    // log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
     pc = new RTCPeerConnection({
       iceServers: iceServers,
       iceCandidatePoolSize: 5, // Pre-gather ICE candidates for faster connection
@@ -155,78 +234,12 @@
     localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
     localEl.play().catch(() => {});
 
-    // Enable mute button
-    document.getElementById("muteBtn").disabled = false;
-
     localStream.getTracks().forEach((t) => {
       pc.addTrack(t, localStream);
       log(`added track ${t.label} ${t.kind}`);
     });
 
-    pc.ontrack = async (e) => {
-      if (e.streams[0]) {
-        const stream = e.streams[0];
-        remoteEl.srcObject = stream;
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
-
-        log(`received remote stream with ${stream.getTracks().length} tracks`);
-
-        stream.getTracks().forEach((t) => {
-          log(`received track ${t.label} ${t.kind}`);
-        });
-
-        try {
-          await remoteEl.play();
-          log("remote video+audio playing successfully");
-        } catch (err) {
-          log("remote.play blocked:", err.message);
-        }
-      }
-    };
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        // Track ICE candidates
-        iceCandidates.push({
-          type: e.candidate.type,
-          protocol: e.candidate.protocol,
-          address: e.candidate.address,
-          port: e.candidate.port,
-          candidateType: e.candidate.candidateType || e.candidate.type,
-        });
-
-        // Update UI
-        updateIceInfo();
-
-        // Log candidate
-        log(
-          `ICE candidate: ${e.candidate.type} ${e.candidate.protocol} ${e.candidate.address}:${e.candidate.port}`
-        );
-
-        send({ type: "ice", candidate: e.candidate });
-      } else {
-        log("ICE gathering complete");
-      }
-    };
-
-    // Monitor connection state
-    pc.onconnectionstatechange = () => {
-      log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
-      if (pc.connectionState === "connected") {
-        log("✅ Two-way communication established!");
-        // Get connection stats to see which candidate is being used
-        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
-      }
-    };
-
-    // Monitor ICE connection state
-    pc.oniceconnectionstatechange = () => {
-      log(`ICE connection state: ${pc.iceConnectionState}`);
-      if (pc.iceConnectionState === "connected") {
-        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
-      }
-    };
+    setupWebRTCHandlers();
 
     ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
     ws.onopen = () => log("[WebSocket] open");
@@ -236,47 +249,76 @@
       let msg;
       try {
         msg = JSON.parse(ev.data);
+        log(
+          `[received] ${msg.type}:`,
+          JSON.stringify(msg).substring(0, 200) + "..."
+        );
       } catch (e) {
         return log("drop non-JSON", ev.data, e);
       }
 
       if (msg.type === "role") {
         role = msg.role;
+        log(`received role message: ${role}`);
         document.getElementById("role").textContent = role;
-        if (role === "host") log("waiting for peer to join (room.ready)...");
         return;
       }
 
-      if (role === "host" && msg.type === "room" && msg.status === "ready") {
-        if (pc.signalingState === "stable" && haveLocalMedia) {
-          log("room ready → creating offer");
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          send({ type: "offer", sdp: offer.sdp });
+      if (msg.type === "room" && msg.event === "peer-joined") {
+        log(`peer joined → room now has ${msg.peerCount} peers`);
+        log(
+          `Debug: role=${role}, signalingState=${pc?.signalingState}, haveLocalMedia=${haveLocalMedia}`
+        );
+        if (role === "host" && msg.peerCount > 1 && haveLocalMedia) {
+          // If WebRTC connection is closed, create a new one
+          if (!pc || pc.connectionState === "closed") {
+            log("Creating new WebRTC connection for rejoining peer");
+            let iceServers = await fetchIceServers();
+            pc = new RTCPeerConnection({
+              iceServers: iceServers,
+              iceCandidatePoolSize: 5,
+            });
+
+            // Re-add tracks to new connection
+            localStream.getTracks().forEach((t) => {
+              pc.addTrack(t, localStream);
+            });
+
+            // Re-setup event handlers
+            setupWebRTCHandlers();
+          }
+
+          if (pc.signalingState === "stable") {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            log("sending [offer]");
+            send({ type: "offer", sdp: offer.sdp });
+          }
         }
         return;
       }
 
       if (msg.type === "offer") {
-        log("received offer → sent answer");
-
         await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
         while (pendingIce.length) {
           await pc.addIceCandidate(pendingIce.shift());
         }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        log("sending [answer]");
         send({ type: "answer", sdp: answer.sdp });
-      } else if (msg.type === "answer") {
-        log("received answer");
+        return;
+      }
 
+      if (msg.type === "answer") {
         await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
         while (pendingIce.length) {
           await pc.addIceCandidate(pendingIce.shift());
         }
-      } else if (msg.type === "ice") {
-        log("received ice candidate", msg.candidate);
+        return;
+      }
 
+      if (msg.type === "ice") {
         const c = msg.candidate;
         if (pc.remoteDescription) {
           try {
@@ -287,15 +329,44 @@
         } else {
           pendingIce.push(c);
         }
-      } else if (msg.type === "bye") {
+        return;
+      }
+
+      if (msg.type === "bye") {
         log("peer said bye → closing");
         await cleanup("peer-bye");
+        return;
+      }
+
+      if (msg.type === "peer-left") {
+        log("peer left unexpectedly → staying in room, ready for new peer");
+        // Don't cleanup - stay in room for new peer to join
+        // Just clear the remote video and reset WebRTC state
+        remoteEl.srcObject = null;
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        // Update role from server message
+        role = msg.newRole || "host";
+        document.getElementById("role").textContent = role;
+        // Reset pending ICE candidates
+        pendingIce = [];
+        // Reset ICE info display
+        iceCandidates = [];
+        activeCandidate = null;
+        document.getElementById("connectionType").textContent = "—";
+        document.getElementById("activeCandidate").textContent = "—";
+        document.getElementById("candidateCount").textContent = "0";
+        log(
+          `🔄 Ready for new peer to join (waiting for room.ready)... Role: ${role}`
+        );
+        return;
       }
     };
   }
 
-  async function hangup() {
-    send({ type: "bye" });
+  async function bye() {
     await cleanup("self-bye");
   }
 
@@ -318,28 +389,20 @@
   }
 
   async function cleanup(tag) {
-    try {
-      ws?.close();
-    } catch {}
-    ws = null;
+    if (tag === "self-bye") {
+      send({ type: "bye" });
+      try {
+        ws?.close();
+      } catch {}
+      ws = null;
+    }
 
     try {
       pc?.close();
     } catch {}
     pc = null;
 
-    // Stop and clear local media
-    // if (localStream) {
-    //   localStream.getTracks().forEach((t) => t.stop());
-    //   localStream = null;
-    // }
-
-    // Clear video elements
-    // localEl.srcObject = null;
     remoteEl.srcObject = null;
-
-    // Reset state variables
-    // haveLocalMedia = false;
     role = null;
     pendingIce = [];
 
@@ -355,11 +418,6 @@
   function send(obj) {
     const s = JSON.stringify(obj);
     ws?.send(s);
-    if (obj.sdp === undefined) {
-      log("[send]", s);
-    } else {
-      log("[send]", obj.type);
-    }
   }
 
   function updateIceInfo() {

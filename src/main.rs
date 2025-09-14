@@ -1,14 +1,13 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::{
-    Json, Router,
+    Router,
     extract::{
-        Path, Query, State,
+        Query, State,
         ws::{CloseFrame, close_code},
     },
-    http::StatusCode,
     response::Html,
-    routing::{get, post},
+    routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -18,8 +17,8 @@ use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tracing::{info, warn};
 use tracing_subscriber;
 use uuid::Uuid;
 
@@ -36,25 +35,35 @@ enum ClientMessage {
     Bye,
 }
 
+type PeerTx = mpsc::UnboundedSender<String>;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum Role {
+    Host,
+    Guest,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Host => write!(f, "host"),
+            Role::Guest => write!(f, "guest"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Room {
-    peers: Vec<(String, PeerTx)>, // (peer_id, peer_tx)
+    peers: Vec<(Role, String, PeerTx)>, // (role,peer_id, peer_tx)
 }
 
-type Rooms = Arc<RwLock<HashMap<String, Room>>>;
-
-#[derive(Serialize, Deserialize)]
-struct RoomId {
-    roomId: String,
-}
-
-type PeerTx = mpsc::UnboundedSender<String>;
+type RoomRegistry = Arc<RwLock<HashMap<String, Room>>>;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
 
-    let rooms: Rooms = Arc::new(RwLock::new(HashMap::new()));
+    let room_registry: RoomRegistry = Arc::new(RwLock::new(HashMap::new()));
 
     let app = Router::new()
         .route("/", get(index)) // serve your page
@@ -62,7 +71,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         // .route("/rooms", post(create_room))
         // .route("/rooms/{id}", get(get_room))
-        .with_state(rooms);
+        .with_state(room_registry);
 
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
     let listener = TcpListener::bind(addr).await.expect("bind {addr} failed");
@@ -77,64 +86,42 @@ async fn index() -> Html<&'static str> {
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(q): Query<RoomId>,
-    State(rooms): State<Rooms>,
+    Query(params): Query<HashMap<String, String>>,
+    State(room_registry): State<RoomRegistry>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, rooms, q.roomId))
+    let room_id = params.get("roomId").unwrap().clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, room_registry, room_id))
 }
 
-async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
+async fn handle_socket(socket: WebSocket, room_registry: RoomRegistry, room_id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<String>();
     let peer_id = Uuid::new_v4().to_string();
 
-    let (role_opt, ready_targets): (Option<String>, Vec<PeerTx>) = {
-        let mut guard = rooms.write().await;
-        let room = guard.entry(room_id.clone()).or_default();
+    let (role, peer_channels): (Role, Vec<PeerTx>) = {
+        let mut registry_guard = room_registry.write().await;
+        let room = registry_guard.entry(room_id.clone()).or_default();
 
-        // If already full, signal "reject" (handle after we release the lock)
-        if room.peers.len() >= 2 {
-            (None, Vec::new())
+        let role = if room.peers.is_empty() {
+            Role::Host
         } else {
-            // Add this peer
-            room.peers.push((peer_id.clone(), peer_tx.clone()));
+            Role::Guest
+        };
 
-            // Role is based on new length
-            let role = if room.peers.len() == 1 {
-                "host".to_string()
-            } else {
-                "guest".to_string()
-            };
+        room.peers
+            .push((role.clone(), peer_id.clone(), peer_tx.clone()));
 
-            // If this made the room reach 2 peers, notify both peers that the room is ready
-            let ready_targets = if room.peers.len() == 2 {
-                room.peers
-                    .iter()
-                    .map(|(_, peer_tx)| peer_tx.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let peer_channels = room
+            .peers
+            .iter()
+            .map(|(_, _, peer_tx)| peer_tx.clone())
+            .collect();
 
-            (Some(role), ready_targets)
-        }
+        (role, peer_channels)
     };
 
-    let role = match role_opt {
-        Some(r) => r,
-        None => {
-            info!(%peer_id, %room_id, "room full → sending WS Close");
-            let _ = ws_tx
-                .send(Message::Close(Some(CloseFrame {
-                    code: close_code::POLICY,
-                    reason: "room full".into(),
-                })))
-                .await;
-            return;
-        }
-    };
-
-    let role_msg = serde_json::json!({ "type": "role", "role": role });
+    // Notify new peer about their role
+    let role_msg = serde_json::json!({ "type": "role", "role": role.to_string() });
     if ws_tx
         .send(Message::Text(role_msg.to_string().into()))
         .await
@@ -144,12 +131,13 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
     }
     info!(%peer_id, %room_id, %role, "peer joined");
 
-    let ready_msg = serde_json::json!({ "type": "room", "status": "ready" });
-    for peer_tx in ready_targets {
-        let _ = peer_tx.send(ready_msg.to_string());
+    // Notify new peer about the number of peers in the room
+    let peer_joined_msg = serde_json::json!({ "type": "room", "event": "peer-joined", "peerCount": peer_channels.len() });
+    for peer_tx in peer_channels {
+        let _ = peer_tx.send(peer_joined_msg.to_string());
     }
 
-    let rooms_fwd = rooms.clone();
+    let room_registry_fwd = room_registry.clone();
     let room_id_fwd = room_id.clone();
     let peer_id_fwd = peer_id.clone();
 
@@ -162,12 +150,12 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
                         info!(%peer_id_fwd, %room_id_fwd, "got BYE → forwarding and closing");
 
                         let targets: Vec<UnboundedSender<String>> = {
-                            let rooms_map = rooms_fwd.read().await;
+                            let rooms_map = room_registry_fwd.read().await;
                             if let Some(room) = rooms_map.get(&room_id_fwd) {
                                 room.peers
                                     .iter()
-                                    .filter(|(pid, _)| pid != &peer_id_fwd)
-                                    .map(|(_, tx)| tx.clone())
+                                    .filter(|(_, pid, _)| pid != &peer_id_fwd)
+                                    .map(|(_, _, tx)| tx.clone())
                                     .collect()
                             } else {
                                 Vec::new()
@@ -181,12 +169,12 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
                     }
                     Ok(_valid) => {
                         let targets: Vec<UnboundedSender<String>> = {
-                            let rooms_map = rooms_fwd.read().await;
+                            let rooms_map = room_registry_fwd.read().await;
                             if let Some(room) = rooms_map.get(&room_id_fwd) {
                                 room.peers
                                     .iter()
-                                    .filter(|(pid, _)| pid != &peer_id_fwd)
-                                    .map(|(_, tx)| tx.clone())
+                                    .filter(|(_, pid, _)| pid != &peer_id_fwd)
+                                    .map(|(_, _, tx)| tx.clone())
                                     .collect()
                             } else {
                                 Vec::new()
@@ -232,15 +220,24 @@ async fn handle_socket(socket: WebSocket, rooms: Rooms, room_id: String) {
     }
 
     {
-        let mut guard = rooms.write().await;
+        let mut guard = room_registry.write().await;
         if let Some(room) = guard.get_mut(&room_id) {
-            // Delete the room if no peers remain
-            if room.peers.is_empty() {
-                guard.remove(&room_id);
+            // Remove this peer from the room
+            room.peers
+                .retain(|(_, pid, tx)| pid != &peer_id && !tx.is_closed());
+
+            // If there's still a peer remaining, notify them that the other peer left
+            if !room.peers.is_empty() {
+                // The remaining peer becomes the host
+                let peer_left_msg = serde_json::json!({ "type": "peer-left", "newRole": "host" });
+                for (_, _, peer_tx) in &room.peers {
+                    let _ = peer_tx.send(peer_left_msg.to_string());
+                }
+                info!(%peer_id, %room_id, "notified remaining peer that peer left, they are now host");
             } else {
-                // Remove this peer from the room
-                room.peers
-                    .retain(|(pid, tx)| pid != &peer_id && !tx.is_closed());
+                // Delete the room if no peers remain
+                guard.remove(&room_id);
+                info!(%peer_id, %room_id, "room deleted - no peers remaining");
             }
         }
     }
