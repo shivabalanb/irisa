@@ -26,16 +26,38 @@
     max-height: 40vh;
     overflow: auto;
   }
+  select {
+    padding: 4px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: white;
+    margin: 0 4px;
+  }
+  label {
+    font-weight: 500;
+    margin-right: 8px;
+  }
 </style>
 
-<h2>P2P WebRTC test (Rust signaling)</h2>
+<h2>P2P</h2>
 <div class="row">
   <input id="room" value="abc" />
   <button onclick="connect()">Connect</button>
   <button onclick="bye()">Bye</button>
-  <button id="muteBtn" onclick="toggleMute()" disabled>Mute Audio</button>
-  <button onclick="getConnectionStats()">Refresh Stats</button>
+  <button id="muteBtn" onclick="toggleMute()" disabled style="display: none">
+    Mute Audio
+  </button>
+  <button id="videoToggleBtn" onclick="toggleVideo()" style="display: none">
+    Disable Video
+  </button>
   <span>Role: <b id="role">—</b></span>
+</div>
+
+<div class="row" id="deviceControls" style="display: none">
+  <label>Camera:</label>
+  <select id="videoSelect" onchange="changeVideoInput()"></select>
+  <label>Microphone:</label>
+  <select id="audioSelect" onchange="changeAudioInput()"></select>
 </div>
 
 <div class="row">
@@ -43,16 +65,9 @@
   <video id="remote" playsinline></video>
 </div>
 
-<h3>ICE Candidates</h3>
 <div id="iceInfo">
   <div>
     <strong>Connection Type:</strong> <span id="connectionType">—</span>
-  </div>
-  <div>
-    <strong>Active Candidate:</strong> <span id="activeCandidate">—</span>
-  </div>
-  <div>
-    <strong>Total Candidates:</strong> <span id="candidateCount">0</span>
   </div>
 </div>
 
@@ -73,6 +88,8 @@
   let isMuted = false;
   let iceCandidates = [];
   let activeCandidate = null;
+  let availableDevices = [];
+  let isVideoEnabled = true;
 
   const localEl = document.getElementById("local");
   const remoteEl = document.getElementById("remote");
@@ -82,40 +99,19 @@
       if (e.streams[0]) {
         const stream = e.streams[0];
         remoteEl.srcObject = stream;
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
 
         log(`received remote stream with ${stream.getTracks().length} tracks`);
-
-        stream.getTracks().forEach((t) => {
-          log(`received track ${t.label} ${t.kind}`);
-        });
-
         try {
           await remoteEl.play();
           log("✅ remote video+audio playing successfully");
         } catch (err) {
           log("❌ remote.play blocked:", err.message);
-          log("💡 Click anywhere to start video");
-
-          // Add click handler to play video
-          const playVideo = async () => {
-            try {
-              await remoteEl.play();
-              log("✅ Remote video playing after user interaction");
-            } catch (e) {
-              log("❌ Still blocked after user interaction:", e.message);
-            }
-          };
-
-          document.addEventListener("click", playVideo, { once: true });
         }
       }
     };
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        // Track ICE candidates
         iceCandidates.push({
           type: e.candidate.type,
           protocol: e.candidate.protocol,
@@ -123,28 +119,17 @@
           port: e.candidate.port,
           candidateType: e.candidate.candidateType || e.candidate.type,
         });
-
-        // Update UI
-        updateIceInfo();
-
-        // Log candidate
-        // log(
-        //   `ICE candidate: ${e.candidate.type} ${e.candidate.protocol} ${e.candidate.address}:${e.candidate.port}`
-        // );
-
         send({ type: "ice", candidate: e.candidate });
       } else {
         log("ICE gathering complete");
       }
     };
 
-    // Monitor connection state
     pc.onconnectionstatechange = () => {
       log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
         log("✅ Two-way communication established!");
-        // Get connection stats to see which candidate is being used
-        setTimeout(() => getConnectionStats(), 1000); // Wait a bit for stats to be ready
+        setTimeout(() => getConnectionStats(), 1000);
       }
     };
   }
@@ -202,44 +187,10 @@
     const roomId = document.getElementById("room").value.trim();
     if (!roomId) return alert("enter room id");
 
-    // Reset ICE info
     iceCandidates = [];
     activeCandidate = null;
     document.getElementById("connectionType").textContent = "—";
-    document.getElementById("activeCandidate").textContent = "—";
-    document.getElementById("candidateCount").textContent = "0";
-    // Enable mute button
     document.getElementById("muteBtn").disabled = false;
-
-    let iceServers = await fetchIceServers();
-
-    // log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
-    pc = new RTCPeerConnection({
-      iceServers: iceServers,
-      iceCandidatePoolSize: 5, // Pre-gather ICE candidates for faster connection
-    });
-
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      haveLocalMedia = true;
-    } catch (e) {
-      log("getUserMedia failed:", e.message || e);
-      return;
-    }
-
-    localEl.srcObject = localStream;
-    localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
-    localEl.play().catch(() => {});
-
-    localStream.getTracks().forEach((t) => {
-      pc.addTrack(t, localStream);
-      log(`added track ${t.label} ${t.kind}`);
-    });
-
-    setupWebRTCHandlers();
 
     ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
     ws.onopen = () => log("[WebSocket] open");
@@ -270,7 +221,6 @@
           `Debug: role=${role}, signalingState=${pc?.signalingState}, haveLocalMedia=${haveLocalMedia}`
         );
         if (role === "host" && msg.peerCount > 1 && haveLocalMedia) {
-          // If WebRTC connection is closed, create a new one
           if (!pc || pc.connectionState === "closed") {
             log("Creating new WebRTC connection for rejoining peer");
             let iceServers = await fetchIceServers();
@@ -279,12 +229,10 @@
               iceCandidatePoolSize: 5,
             });
 
-            // Re-add tracks to new connection
             localStream.getTracks().forEach((t) => {
               pc.addTrack(t, localStream);
             });
 
-            // Re-setup event handlers
             setupWebRTCHandlers();
           }
 
@@ -340,19 +288,16 @@
 
       if (msg.type === "peer-left") {
         log("peer left unexpectedly → staying in room, ready for new peer");
-        // Don't cleanup - stay in room for new peer to join
-        // Just clear the remote video and reset WebRTC state
+
         remoteEl.srcObject = null;
         if (pc) {
           pc.close();
           pc = null;
         }
-        // Update role from server message
+
         role = msg.newRole || "host";
         document.getElementById("role").textContent = role;
-        // Reset pending ICE candidates
         pendingIce = [];
-        // Reset ICE info display
         iceCandidates = [];
         activeCandidate = null;
         document.getElementById("connectionType").textContent = "—";
@@ -364,6 +309,41 @@
         return;
       }
     };
+
+    let iceServers = await fetchIceServers();
+    // log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
+    pc = new RTCPeerConnection({
+      iceServers: iceServers,
+      iceCandidatePoolSize: 5, // Pre-gather ICE candidates for faster connection
+    });
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      haveLocalMedia = true;
+
+      await refreshDevices();
+    } catch (e) {
+      log("getUserMedia failed:", e.message || e);
+      return;
+    }
+
+    localEl.srcObject = localStream;
+    localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
+    localEl.play().catch(() => {});
+
+    localStream.getTracks().forEach((t) => {
+      pc.addTrack(t, localStream);
+      log(`added track ${t.label} ${t.kind}`);
+    });
+
+    setupWebRTCHandlers();
+
+    document.getElementById("deviceControls").style.display = "flex";
+    document.getElementById("muteBtn").style.display = "inline-block";
+    document.getElementById("videoToggleBtn").style.display = "inline-block";
   }
 
   async function bye() {
@@ -384,6 +364,36 @@
         isMuted
           ? "Audio muted (local + remote)"
           : "Audio unmuted (local + remote)"
+      );
+    }
+  }
+
+  function toggleVideo() {
+    if (!localStream) return;
+
+    const videoTracks = localStream.getVideoTracks();
+    if (videoTracks.length > 0) {
+      isVideoEnabled = !isVideoEnabled;
+      videoTracks[0].enabled = isVideoEnabled;
+
+      const videoToggleBtn = document.getElementById("videoToggleBtn");
+      if (videoToggleBtn) {
+        videoToggleBtn.textContent = isVideoEnabled
+          ? "Disable Video"
+          : "Enable Video";
+      }
+
+      if (isVideoEnabled) {
+        localEl.srcObject = localStream;
+        localEl.play().catch(() => {});
+      } else {
+        localEl.srcObject = null;
+      }
+
+      log(
+        isVideoEnabled
+          ? "Video enabled (local + remote)"
+          : "Video disabled (local + remote)"
       );
     }
   }
@@ -410,6 +420,9 @@
     document.getElementById("role").textContent = "—";
     document.getElementById("muteBtn").disabled = true;
     document.getElementById("muteBtn").textContent = "Mute Audio";
+    document.getElementById("muteBtn").style.display = "none";
+    document.getElementById("videoToggleBtn").style.display = "none";
+    document.getElementById("deviceControls").style.display = "none";
     isMuted = false;
 
     log("cleanup complete:", tag);
@@ -418,11 +431,6 @@
   function send(obj) {
     const s = JSON.stringify(obj);
     ws?.send(s);
-  }
-
-  function updateIceInfo() {
-    document.getElementById("candidateCount").textContent =
-      iceCandidates.length;
   }
 
   async function getConnectionStats() {
@@ -531,6 +539,114 @@
       window.currentActiveCandidate = activeCandidateInfo;
     } catch (e) {
       log("Failed to get connection stats:", e.message);
+    }
+  }
+
+  async function refreshDevices() {
+    try {
+      await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      availableDevices = devices;
+
+      const videoDevices = devices.filter(
+        (device) => device.kind === "videoinput"
+      );
+      const videoSelect = document.getElementById("videoSelect");
+
+      videoDevices.forEach((device, index) => {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+        option.text = device.label || `Camera ${index + 1}`;
+        videoSelect.appendChild(option);
+      });
+
+      const audioDevices = devices.filter(
+        (device) => device.kind === "audioinput"
+      );
+      const audioSelect = document.getElementById("audioSelect");
+      audioSelect.innerHTML = "";
+
+      audioDevices.forEach((device, index) => {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+        option.text = device.label || `Microphone ${index + 1}`;
+        audioSelect.appendChild(option);
+      });
+
+      log(
+        `📱 Found ${videoDevices.length} cameras and ${audioDevices.length} microphones`
+      );
+    } catch (error) {
+      log("❌ Failed to refresh devices:", error.message);
+    }
+  }
+
+  async function replaceTrack(oldTrack, newTrack, trackKind) {
+    if (oldTrack) {
+      localStream.removeTrack(oldTrack);
+      oldTrack.stop();
+    }
+
+    if (newTrack) {
+      localStream.addTrack(newTrack);
+    }
+
+    if (pc) {
+      const sender = pc
+        .getSenders()
+        .find((s) => s.track && s.track.kind === trackKind);
+      if (sender) {
+        await sender.replaceTrack(newTrack);
+      }
+    }
+  }
+
+  async function changeVideoInput() {
+    const videoSelect = document.getElementById("videoSelect");
+    const selectedDeviceId = videoSelect.value;
+
+    if (!localStream || !selectedDeviceId) return;
+
+    try {
+      const oldVideoTrack = localStream.getVideoTracks()[0];
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: selectedDeviceId } },
+        audio: false,
+      });
+      const newVideoTrack = newStream.getVideoTracks()[0];
+
+      await replaceTrack(oldVideoTrack, newVideoTrack, "video");
+      newVideoTrack.applyConstraints({ aspectRatio: 16 / 9 });
+
+      log(
+        `📹 Switched to camera: ${videoSelect.options[videoSelect.selectedIndex].text}`
+      );
+    } catch (error) {
+      log("❌ Failed to change video input:", error.message);
+    }
+  }
+
+  async function changeAudioInput() {
+    const audioSelect = document.getElementById("audioSelect");
+    const selectedDeviceId = audioSelect.value;
+
+    if (!localStream || !selectedDeviceId) return;
+
+    try {
+      const oldAudioTrack = localStream.getAudioTracks()[0];
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: false,
+        audio: { deviceId: { exact: selectedDeviceId } },
+      });
+      const newAudioTrack = newStream.getAudioTracks()[0];
+
+      await replaceTrack(oldAudioTrack, newAudioTrack, "audio");
+
+      log(
+        `🎤 Switched to microphone: ${audioSelect.options[audioSelect.selectedIndex].text}`
+      );
+    } catch (error) {
+      log("❌ Failed to change audio input:", error.message);
     }
   }
 
