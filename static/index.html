@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8" />
-<title>P2P WebRTC test (Rust signaling)</title>
+<title>Irisa – P2P WebRTC video chat app</title>
 <style>
   body {
     font-family: system-ui, sans-serif;
@@ -39,7 +39,7 @@
   }
 </style>
 
-<h2>P2P</h2>
+<h2>Irisa – P2P WebRTC video chat app</h2>
 <div class="row">
   <input id="room" value="abc" />
   <button onclick="connect()">Connect</button>
@@ -51,6 +51,7 @@
     Disable Video
   </button>
   <span>Role: <b id="role">—</b></span>
+  <span>Peer ID: <b id="peerId">—</b></span>
 </div>
 
 <div class="row" id="deviceControls" style="display: none">
@@ -62,7 +63,7 @@
 
 <div class="row">
   <video id="local" playsinline muted></video>
-  <video id="remote" playsinline></video>
+  <div id="remoteVideos"></div>
 </div>
 
 <div id="iceInfo">
@@ -80,9 +81,10 @@
     location.host +
     "/ws";
   let ws,
-    pc,
+    pcs = new Map(),
     localStream,
-    role = null;
+    role = null,
+    myPeerId = null;
   let haveLocalMedia = false;
   let pendingIce = [];
   let isMuted = false;
@@ -94,19 +96,265 @@
   const localEl = document.getElementById("local");
   const remoteEl = document.getElementById("remote");
 
-  function setupWebRTCHandlers() {
-    pc.ontrack = async (e) => {
-      if (e.streams[0]) {
-        const stream = e.streams[0];
-        remoteEl.srcObject = stream;
+  async function connect() {
+    const roomId = document.getElementById("room").value.trim();
+    if (!roomId) return alert("enter room id");
 
-        log(`received remote stream with ${stream.getTracks().length} tracks`);
-        try {
-          await remoteEl.play();
-          log("✅ remote video+audio playing successfully");
-        } catch (err) {
-          log("❌ remote.play blocked:", err.message);
+    iceCandidates = [];
+    activeCandidate = null;
+    document.getElementById("connectionType").textContent = "—";
+    document.getElementById("muteBtn").disabled = false;
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      haveLocalMedia = true;
+
+      await refreshDevices();
+    } catch (e) {
+      return;
+    }
+
+    localEl.srcObject = localStream;
+    localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
+    localEl.play().catch(() => {});
+
+    document.getElementById("deviceControls").style.display = "flex";
+    document.getElementById("muteBtn").style.display = "inline-block";
+    document.getElementById("videoToggleBtn").style.display = "inline-block";
+
+    ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
+    ws.onopen = () => log("[WebSocket] open");
+    ws.onclose = (e) => log("[WebSocket] close", e.code, e.reason || "");
+    ws.onerror = (e) => log("[WebSocket] error", e.message || e);
+    ws.onmessage = async (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {}
+
+      if (msg.type === "role") {
+        role = msg.role;
+        myPeerId = msg.peerId;
+        document.getElementById("role").textContent = role;
+        document.getElementById("peerId").textContent = myPeerId;
+      }
+
+      if (msg.type === "room" && msg.event === "peer-joined") {
+        const newPeerId = msg.peerId;
+
+        if (newPeerId !== myPeerId && haveLocalMedia && !pcs.has(newPeerId)) {
+          await createPeerConnection(newPeerId);
+          await sendOffer(newPeerId);
         }
+        return;
+      }
+
+      if (msg.type === "offer") {
+        const existingPeerId = msg.fromPeer;
+        log(`received [offer] from peer ${existingPeerId}`);
+
+        if (!pcs.has(existingPeerId)) {
+          await createPeerConnection(existingPeerId);
+          await sendAnswer(existingPeerId, msg.sdp);
+        }
+        return;
+      }
+
+      if (msg.type === "answer") {
+        const existingPeerId = msg.fromPeer;
+        log(`received [answer] from peer ${existingPeerId}`);
+
+        // Get peer connection for this peer
+        const targetPc = pcs.get(existingPeerId);
+        if (targetPc) {
+          await targetPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+          while (pendingIce.length) {
+            await targetPc.addIceCandidate(pendingIce.shift());
+          }
+        }
+        return;
+      }
+
+      if (msg.type === "ice") {
+        const c = msg.candidate;
+        const existingPeerId = msg.fromPeer;
+
+        // Get peer connection for this peer
+        const targetPc = pcs.get(existingPeerId);
+        if (targetPc) {
+          if (targetPc.remoteDescription) {
+            try {
+              await targetPc.addIceCandidate(c);
+            } catch (e) {}
+          } else {
+            pendingIce.push(c);
+          }
+        } else {
+          pendingIce.push(c);
+        }
+        return;
+      }
+
+      if (msg.type === "bye") {
+        log("peer said bye → closing");
+        await cleanup("peer-bye");
+        return;
+      }
+
+      if (msg.type === "peer-left") {
+        const leftPeerId = msg.peerId;
+        log(
+          `peer ${leftPeerId} left unexpectedly → staying in room, ready for new peer`
+        );
+
+        // Close the specific peer connection and remove its video
+        const leftPc = pcs.get(leftPeerId);
+        if (leftPc) {
+          leftPc.close();
+          pcs.delete(leftPeerId);
+          log(`Closed connection to peer ${leftPeerId}`);
+        }
+
+        // Remove the remote video container for this peer
+        const videoContainer = document.getElementById(
+          `container-${leftPeerId}`
+        );
+        if (videoContainer) {
+          videoContainer.remove();
+        }
+
+        role = msg.newRole || "host";
+        document.getElementById("role").textContent = role;
+        pendingIce = [];
+        iceCandidates = [];
+        activeCandidate = null;
+        document.getElementById("connectionType").textContent = "—";
+        log(
+          `🔄 Ready for new peer to join (waiting for room.ready)... Role: ${role}`
+        );
+        return;
+      }
+    };
+  }
+
+  async function createPeerConnection(peerId) {
+    // Check if PC already exists
+    if (pcs.has(peerId)) {
+      log(`❌ PC already exists for peer ${peerId}`);
+      return pcs.get(peerId);
+    }
+
+    log(`[RTCPeerConnection] creating new PC for peer ${peerId}`);
+    let iceServers = await fetchIceServers();
+    const pc = new RTCPeerConnection({
+      iceServers: iceServers,
+      iceCandidatePoolSize: 5,
+    });
+
+    localStream.getTracks().forEach((t) => {
+      pc.addTrack(t, localStream);
+    });
+
+    setupWebRTCHandlers(pc, peerId);
+    pcs.set(peerId, pc);
+
+    return pc;
+  }
+
+  async function sendOffer(peerId) {
+    const pc = pcs.get(peerId);
+    if (!pc) return;
+
+    if (pc.signalingState === "stable") {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      log(`sending [offer] to peer ${peerId}`);
+      send({
+        type: "offer",
+        sdp: offer.sdp,
+        targetPeer: peerId,
+        fromPeer: myPeerId,
+      });
+    }
+  }
+
+  async function sendAnswer(peerId, offerSdp) {
+    const pc = pcs.get(peerId);
+    if (!pc) return;
+
+    await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    while (pendingIce.length) {
+      await pc.addIceCandidate(pendingIce.shift());
+    }
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    log(`sending [answer] to peer ${peerId}`);
+    send({
+      type: "answer",
+      sdp: answer.sdp,
+      targetPeer: peerId,
+      fromPeer: myPeerId,
+    });
+  }
+
+  function setupWebRTCHandlers(pc, peerId) {
+    pc.ontrack = async (e) => {
+      const stream = e.streams[0];
+      if (stream) {
+        let remoteVideo = document.getElementById(`remote-${peerId}`);
+
+        if (!remoteVideo) {
+          // Create video container with peer ID label
+          const videoContainer = document.createElement("div");
+          videoContainer.id = `container-${peerId}`;
+          videoContainer.style.position = "relative";
+          videoContainer.style.width = "70%";
+          videoContainer.style.display = "inline-block";
+          videoContainer.style.margin = "4px";
+
+          // Create peer ID label
+          const peerLabel = document.createElement("div");
+          peerLabel.textContent = `Peer: ${peerId.substring(0, 8)}...`;
+          peerLabel.style.position = "absolute";
+          peerLabel.style.top = "4px";
+          peerLabel.style.left = "4px";
+          peerLabel.style.background = "rgba(0, 0, 0, 0.7)";
+          peerLabel.style.color = "white";
+          peerLabel.style.padding = "2px 6px";
+          peerLabel.style.borderRadius = "4px";
+          peerLabel.style.fontSize = "12px";
+          peerLabel.style.fontFamily = "monospace";
+          peerLabel.style.zIndex = "10";
+
+          // Create video element
+          remoteVideo = document.createElement("video");
+          remoteVideo.id = `remote-${peerId}`;
+          remoteVideo.playsInline = true;
+          remoteVideo.style.width = "100%";
+          remoteVideo.style.background = "#d5d5d5";
+          remoteVideo.style.aspectRatio = "16/9";
+          remoteVideo.style.borderRadius = "8px";
+
+          // Add label and video to container
+          videoContainer.appendChild(peerLabel);
+          videoContainer.appendChild(remoteVideo);
+
+          const remoteVideosContainer = document.getElementById("remoteVideos");
+          remoteVideosContainer.appendChild(videoContainer);
+        } else {
+        }
+
+        // Always assign or re-assign srcObject to the stream
+        // The MediaStream object itself will update as tracks are added/removed
+        remoteVideo.srcObject = stream;
+
+        try {
+          await remoteVideo.play();
+        } catch (err) {}
+      } else {
       }
     };
 
@@ -119,17 +367,26 @@
           port: e.candidate.port,
           candidateType: e.candidate.candidateType || e.candidate.type,
         });
-        send({ type: "ice", candidate: e.candidate });
-      } else {
-        log("ICE gathering complete");
+        send({
+          type: "ice",
+          candidate: e.candidate,
+          targetPeer: peerId,
+          fromPeer: myPeerId,
+        });
       }
     };
 
     pc.onconnectionstatechange = () => {
-      log(`[onconnectionstatechange] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
         log("✅ Two-way communication established!");
-        setTimeout(() => getConnectionStats(), 1000);
+
+        // Log the current pcs Map contents
+        log(`📊 Current pcs Map (${pcs.size} connections):`);
+        for (const [peerId, pc] of pcs) {
+          log(
+            `  - Peer ${peerId}: ${pc.connectionState} (signaling: ${pc.signalingState})`
+          );
+        }
       }
     };
   }
@@ -152,9 +409,6 @@
       // Use all servers from API (both STUN and TURN)
       iceServers = [...iceServers, ...dynamicIceServers];
     } catch (e) {
-      log("⚠️ Failed to fetch dynamic TURN servers:", e.message);
-      log("🔄 Falling back to static TURN servers");
-
       // Fallback to static TURN servers
       iceServers.push(
         {
@@ -183,169 +437,6 @@
     return iceServers;
   }
 
-  async function connect() {
-    const roomId = document.getElementById("room").value.trim();
-    if (!roomId) return alert("enter room id");
-
-    iceCandidates = [];
-    activeCandidate = null;
-    document.getElementById("connectionType").textContent = "—";
-    document.getElementById("muteBtn").disabled = false;
-
-    ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
-    ws.onopen = () => log("[WebSocket] open");
-    ws.onclose = (e) => log("[WebSocket] close", e.code, e.reason || "");
-    ws.onerror = (e) => log("[WebSocket] error", e.message || e);
-    ws.onmessage = async (ev) => {
-      let msg;
-      try {
-        msg = JSON.parse(ev.data);
-        log(
-          `[received] ${msg.type}:`,
-          JSON.stringify(msg).substring(0, 200) + "..."
-        );
-      } catch (e) {
-        return log("drop non-JSON", ev.data, e);
-      }
-
-      if (msg.type === "role") {
-        role = msg.role;
-        log(`received role message: ${role}`);
-        document.getElementById("role").textContent = role;
-        return;
-      }
-
-      if (msg.type === "room" && msg.event === "peer-joined") {
-        log(`peer joined → room now has ${msg.peerCount} peers`);
-        log(
-          `Debug: role=${role}, signalingState=${pc?.signalingState}, haveLocalMedia=${haveLocalMedia}`
-        );
-        if (role === "host" && msg.peerCount > 1 && haveLocalMedia) {
-          if (!pc || pc.connectionState === "closed") {
-            log("Creating new WebRTC connection for rejoining peer");
-            let iceServers = await fetchIceServers();
-            pc = new RTCPeerConnection({
-              iceServers: iceServers,
-              iceCandidatePoolSize: 5,
-            });
-
-            localStream.getTracks().forEach((t) => {
-              pc.addTrack(t, localStream);
-            });
-
-            setupWebRTCHandlers();
-          }
-
-          if (pc.signalingState === "stable") {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            log("sending [offer]");
-            send({ type: "offer", sdp: offer.sdp });
-          }
-        }
-        return;
-      }
-
-      if (msg.type === "offer") {
-        await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
-        while (pendingIce.length) {
-          await pc.addIceCandidate(pendingIce.shift());
-        }
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        log("sending [answer]");
-        send({ type: "answer", sdp: answer.sdp });
-        return;
-      }
-
-      if (msg.type === "answer") {
-        await pc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-        while (pendingIce.length) {
-          await pc.addIceCandidate(pendingIce.shift());
-        }
-        return;
-      }
-
-      if (msg.type === "ice") {
-        const c = msg.candidate;
-        if (pc.remoteDescription) {
-          try {
-            await pc.addIceCandidate(c);
-          } catch (e) {
-            log("addIceCandidate err", e);
-          }
-        } else {
-          pendingIce.push(c);
-        }
-        return;
-      }
-
-      if (msg.type === "bye") {
-        log("peer said bye → closing");
-        await cleanup("peer-bye");
-        return;
-      }
-
-      if (msg.type === "peer-left") {
-        log("peer left unexpectedly → staying in room, ready for new peer");
-
-        remoteEl.srcObject = null;
-        if (pc) {
-          pc.close();
-          pc = null;
-        }
-
-        role = msg.newRole || "host";
-        document.getElementById("role").textContent = role;
-        pendingIce = [];
-        iceCandidates = [];
-        activeCandidate = null;
-        document.getElementById("connectionType").textContent = "—";
-        document.getElementById("activeCandidate").textContent = "—";
-        document.getElementById("candidateCount").textContent = "0";
-        log(
-          `🔄 Ready for new peer to join (waiting for room.ready)... Role: ${role}`
-        );
-        return;
-      }
-    };
-
-    let iceServers = await fetchIceServers();
-    // log("🔍 Final iceServers being used:", JSON.stringify(iceServers, null, 2));
-    pc = new RTCPeerConnection({
-      iceServers: iceServers,
-      iceCandidatePoolSize: 5, // Pre-gather ICE candidates for faster connection
-    });
-
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      haveLocalMedia = true;
-
-      await refreshDevices();
-    } catch (e) {
-      log("getUserMedia failed:", e.message || e);
-      return;
-    }
-
-    localEl.srcObject = localStream;
-    localStream.getVideoTracks()[0].applyConstraints({ aspectRatio: 16 / 9 });
-    localEl.play().catch(() => {});
-
-    localStream.getTracks().forEach((t) => {
-      pc.addTrack(t, localStream);
-      log(`added track ${t.label} ${t.kind}`);
-    });
-
-    setupWebRTCHandlers();
-
-    document.getElementById("deviceControls").style.display = "flex";
-    document.getElementById("muteBtn").style.display = "inline-block";
-    document.getElementById("videoToggleBtn").style.display = "inline-block";
-  }
-
   async function bye() {
     await cleanup("self-bye");
   }
@@ -360,11 +451,6 @@
 
       const muteBtn = document.getElementById("muteBtn");
       muteBtn.textContent = isMuted ? "Unmute Audio" : "Mute Audio";
-      log(
-        isMuted
-          ? "Audio muted (local + remote)"
-          : "Audio unmuted (local + remote)"
-      );
     }
   }
 
@@ -389,12 +475,6 @@
       } else {
         localEl.srcObject = null;
       }
-
-      log(
-        isVideoEnabled
-          ? "Video enabled (local + remote)"
-          : "Video disabled (local + remote)"
-      );
     }
   }
 
@@ -405,141 +485,37 @@
         ws?.close();
       } catch {}
       ws = null;
+
+      // Reset UI
+      document.getElementById("role").textContent = "—";
+      document.getElementById("peerId").textContent = "—";
+      document.getElementById("muteBtn").disabled = true;
+      document.getElementById("muteBtn").textContent = "Mute Audio";
+      document.getElementById("muteBtn").style.display = "none";
+      document.getElementById("videoToggleBtn").style.display = "none";
+      document.getElementById("deviceControls").style.display = "none";
+      isMuted = false;
+
+      // Close all peer connections
+      for (const [peerId, pc] of pcs) {
+        try {
+          pc.close();
+        } catch {}
+      }
+      pcs.clear();
+
+      // Clear all remote videos
+      const remoteVideosContainer = document.getElementById("remoteVideos");
+      remoteVideosContainer.innerHTML = "";
+      role = null;
+      myPeerId = null;
+      pendingIce = [];
     }
-
-    try {
-      pc?.close();
-    } catch {}
-    pc = null;
-
-    remoteEl.srcObject = null;
-    role = null;
-    pendingIce = [];
-
-    // Reset UI
-    document.getElementById("role").textContent = "—";
-    document.getElementById("muteBtn").disabled = true;
-    document.getElementById("muteBtn").textContent = "Mute Audio";
-    document.getElementById("muteBtn").style.display = "none";
-    document.getElementById("videoToggleBtn").style.display = "none";
-    document.getElementById("deviceControls").style.display = "none";
-    isMuted = false;
-
-    log("cleanup complete:", tag);
   }
 
   function send(obj) {
     const s = JSON.stringify(obj);
     ws?.send(s);
-  }
-
-  async function getConnectionStats() {
-    try {
-      const stats = await pc.getStats();
-      let connectionType = "Unknown";
-      let activeCandidateInfo = "Unknown";
-
-      // First, collect all individual candidate reports
-      const candidateReports = new Map();
-      let totalCandidatesCount = 0;
-
-      stats.forEach((report) => {
-        if (
-          report.type === "local-candidate" ||
-          report.type === "remote-candidate"
-        ) {
-          candidateReports.set(report.id, report);
-          totalCandidatesCount++;
-        }
-      });
-
-      // Update total candidates count in UI
-      document.getElementById("candidateCount").textContent =
-        totalCandidatesCount;
-
-      // Log all candidate reports to see what we have
-      log(`🔍 Found ${totalCandidatesCount} individual candidate reports:`);
-      candidateReports.forEach((candidate, id) => {
-        log(
-          `   ${id}: ${candidate.candidateType} ${candidate.address}:${candidate.port}`
-        );
-      });
-
-      stats.forEach((report) => {
-        if (report.type === "candidate-pair" && report.state === "succeeded") {
-          log(`🔍 Found succeeded candidate pair: ${report.id}`);
-          log(`   Local candidate ID: ${report.localCandidateId}`);
-          log(`   Remote candidate ID: ${report.remoteCandidateId}`);
-
-          // Look up the actual candidate objects from our map
-          const localCandidate = candidateReports.get(report.localCandidateId);
-          const remoteCandidate = candidateReports.get(
-            report.remoteCandidateId
-          );
-
-          let localType = "unknown";
-          let remoteType = "unknown";
-
-          if (localCandidate) {
-            localType = localCandidate.candidateType || "unknown";
-            log(
-              `   Local candidate: ${localType} ${localCandidate.address}:${localCandidate.port}`
-            );
-          } else {
-            log(`   ❌ Local candidate not found: ${report.localCandidateId}`);
-          }
-
-          if (remoteCandidate) {
-            remoteType = remoteCandidate.candidateType || "unknown";
-            log(
-              `   Remote candidate: ${remoteType} ${remoteCandidate.address}:${remoteCandidate.port}`
-            );
-          } else {
-            log(
-              `   ❌ Remote candidate not found: ${report.remoteCandidateId}`
-            );
-          }
-
-          log(`✅ Extracted - Local: ${localType}, Remote: ${remoteType}`);
-
-          // Determine connection type based on the combination
-          if (localType === "relay" || remoteType === "relay") {
-            connectionType = "🔄 TURN Relay";
-          } else if (localType === "host" && remoteType === "host") {
-            connectionType = "🏠 Direct (Local)";
-          } else if (
-            localType === "srflx" ||
-            remoteType === "srflx" ||
-            localType === "prflx" ||
-            remoteType === "prflx"
-          ) {
-            connectionType = "🌐 STUN (Public IP)";
-          } else {
-            connectionType = "🔗 Mixed Connection";
-          }
-
-          activeCandidateInfo = `${localType} ↔ ${remoteType}`;
-          activeCandidate = {
-            local: localType,
-            remote: remoteType,
-            address: localCandidate?.address || "Unknown",
-          };
-        }
-      });
-
-      // Update UI
-      document.getElementById("connectionType").textContent = connectionType;
-      document.getElementById("activeCandidate").textContent =
-        activeCandidateInfo;
-
-      log(`📊 Connection: ${connectionType} (${activeCandidateInfo})`);
-
-      // Also update the global variables for other functions
-      window.currentConnectionType = connectionType;
-      window.currentActiveCandidate = activeCandidateInfo;
-    } catch (e) {
-      log("Failed to get connection stats:", e.message);
-    }
   }
 
   async function refreshDevices() {
@@ -572,13 +548,7 @@
         option.text = device.label || `Microphone ${index + 1}`;
         audioSelect.appendChild(option);
       });
-
-      log(
-        `📱 Found ${videoDevices.length} cameras and ${audioDevices.length} microphones`
-      );
-    } catch (error) {
-      log("❌ Failed to refresh devices:", error.message);
-    }
+    } catch (error) {}
   }
 
   async function replaceTrack(oldTrack, newTrack, trackKind) {
@@ -591,12 +561,14 @@
       localStream.addTrack(newTrack);
     }
 
-    if (pc) {
+    // Update all peer connections
+    for (const [peerId, pc] of pcs) {
       const sender = pc
         .getSenders()
         .find((s) => s.track && s.track.kind === trackKind);
       if (sender) {
         await sender.replaceTrack(newTrack);
+        // log(`Updated ${trackKind} track for peer ${peerId}`);
       }
     }
   }
@@ -617,13 +589,7 @@
 
       await replaceTrack(oldVideoTrack, newVideoTrack, "video");
       newVideoTrack.applyConstraints({ aspectRatio: 16 / 9 });
-
-      log(
-        `📹 Switched to camera: ${videoSelect.options[videoSelect.selectedIndex].text}`
-      );
-    } catch (error) {
-      log("❌ Failed to change video input:", error.message);
-    }
+    } catch (error) {}
   }
 
   async function changeAudioInput() {
@@ -641,13 +607,7 @@
       const newAudioTrack = newStream.getAudioTracks()[0];
 
       await replaceTrack(oldAudioTrack, newAudioTrack, "audio");
-
-      log(
-        `🎤 Switched to microphone: ${audioSelect.options[audioSelect.selectedIndex].text}`
-      );
-    } catch (error) {
-      log("❌ Failed to change audio input:", error.message);
-    }
+    } catch (error) {}
   }
 
   const log = (...a) => {

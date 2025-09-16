@@ -121,7 +121,7 @@ async fn handle_socket(socket: WebSocket, room_registry: RoomRegistry, room_id: 
     };
 
     // Notify new peer about their role
-    let role_msg = serde_json::json!({ "type": "role", "role": role.to_string() });
+    let role_msg = serde_json::json!({ "type": "role", "role": role.to_string(), "peerId": peer_id });
     if ws_tx
         .send(Message::Text(role_msg.to_string().into()))
         .await
@@ -132,7 +132,12 @@ async fn handle_socket(socket: WebSocket, room_registry: RoomRegistry, room_id: 
     info!(%peer_id, %room_id, %role, "peer joined");
 
     // Notify new peer about the number of peers in the room
-    let peer_joined_msg = serde_json::json!({ "type": "room", "event": "peer-joined", "peerCount": peer_channels.len() });
+    let peer_joined_msg = serde_json::json!({ 
+        "type": "room", 
+        "event": "peer-joined", 
+        "peerCount": peer_channels.len(),
+        "peerId": peer_id 
+    });
     for peer_tx in peer_channels {
         let _ = peer_tx.send(peer_joined_msg.to_string());
     }
@@ -229,7 +234,7 @@ async fn handle_socket(socket: WebSocket, room_registry: RoomRegistry, room_id: 
             // If there's still a peer remaining, notify them that the other peer left
             if !room.peers.is_empty() {
                 // The remaining peer becomes the host
-                let peer_left_msg = serde_json::json!({ "type": "peer-left", "newRole": "host" });
+                let peer_left_msg = serde_json::json!({ "type": "peer-left", "newRole": "host", "peerId": peer_id });
                 for (_, _, peer_tx) in &room.peers {
                     let _ = peer_tx.send(peer_left_msg.to_string());
                 }
