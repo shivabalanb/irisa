@@ -11,8 +11,9 @@ A minimal WebRTC video chat app:
 
 ### What did I learn
 
-I have always wanted to build this. I hacked together a simple prototype, deployed it quickly, and immediately dropped the link in the group chat to test with friends. This project was actually fun as I learned a lot of networking concepts without taking a college course in it. I went deep on WebRTC fundamentals (ICE candidates, offer/answer handshake, TURN vs STUN), browser media APIs (getUserMedia, device switching, track replacement), and the practical realities of signaling, reconnection, and multi‑peer topologies. 
-I saw firsthand how mesh falls apart beyond a few participants and why SFU (star) exist and how different network topologies trade off simplicity, bandwidth, and scalability.
+I have always wanted to build this. I hacked together a simple prototype, deployed it quickly, and immediately dropped the link in the group chat to test with friends. This project was actually fun as I learned a lot of networking concepts without taking a college course in it. I went deep on WebRTC fundamentals (ICE candidates, offer/answer handshake, TURN vs STUN), browser media APIs (getUserMedia, device switching, track replacement), and WebSocket signaling, room management, and multi‑peer topologies. I saw firsthand how mesh falls apart beyond a few participants and why SFU (star) exist and how different network topologies trade off simplicity, bandwidth, and scalability.
+
+In rebuilding from scratch what already exists, I still learned a lot and grew my appetite to delve deeper.
 
 ### Quick start
 
