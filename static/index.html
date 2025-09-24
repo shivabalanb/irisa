@@ -4,13 +4,21 @@
 <style>
   body {
     font-family: system-ui, sans-serif;
+    font-size: 12px;
     padding: 16px;
   }
   video {
-    width: 48%;
     background: #d5d5d5;
     aspect-ratio: 16/9;
   }
+  .video-box {
+    width: 400px;
+    border-radius: 8px;
+  }
+  #local {
+    transform: scaleX(-1); /* Mirror the local video for self-view */
+  }
+
   .row {
     display: flex;
     gap: 12px;
@@ -43,14 +51,12 @@
 <div class="row">
   <input id="room" value="abc" />
   <button onclick="connect()">Connect</button>
-  <button onclick="bye()">Bye</button>
   <button id="muteBtn" onclick="toggleMute()" disabled style="display: none">
     Mute Audio
   </button>
   <button id="videoToggleBtn" onclick="toggleVideo()" style="display: none">
     Disable Video
   </button>
-  <span>Role: <b id="role">—</b></span>
   <span>Peer ID: <b id="peerId">—</b></span>
 </div>
 
@@ -59,17 +65,12 @@
   <select id="videoSelect" onchange="changeVideoInput()"></select>
   <label>Microphone:</label>
   <select id="audioSelect" onchange="changeAudioInput()"></select>
+  <button onclick="refreshDevices()">Refresh Devices</button>
 </div>
 
 <div class="row">
-  <video id="local" playsinline muted></video>
+  <video id="local" class="video-box" playsinline muted></video>
   <div id="remoteVideos"></div>
-</div>
-
-<div id="iceInfo">
-  <div>
-    <strong>Connection Type:</strong> <span id="connectionType">—</span>
-  </div>
 </div>
 
 <h3>Log</h3>
@@ -83,13 +84,10 @@
   let ws,
     pcs = new Map(),
     localStream,
-    role = null,
     myPeerId = null;
   let haveLocalMedia = false;
-  let pendingIce = [];
+  let pendingIce = new Map(); // peerId -> RTCIceCandidateInit[]
   let isMuted = false;
-  let iceCandidates = [];
-  let activeCandidate = null;
   let availableDevices = [];
   let isVideoEnabled = true;
 
@@ -100,9 +98,6 @@
     const roomId = document.getElementById("room").value.trim();
     if (!roomId) return alert("enter room id");
 
-    iceCandidates = [];
-    activeCandidate = null;
-    document.getElementById("connectionType").textContent = "—";
     document.getElementById("muteBtn").disabled = false;
 
     try {
@@ -126,118 +121,92 @@
     document.getElementById("videoToggleBtn").style.display = "inline-block";
 
     ws = new WebSocket(`${WS_URL}?roomId=${encodeURIComponent(roomId)}`);
-    ws.onopen = () => log("[WebSocket] open");
-    ws.onclose = (e) => log("[WebSocket] close", e.code, e.reason || "");
-    ws.onerror = (e) => log("[WebSocket] error", e.message || e);
     ws.onmessage = async (ev) => {
-      let msg;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch (e) {}
+      const msg = JSON.parse(ev.data);
 
-      if (msg.type === "role") {
-        role = msg.role;
-        myPeerId = msg.peerId;
-        document.getElementById("role").textContent = role;
-        document.getElementById("peerId").textContent = myPeerId;
-      }
-
-      if (msg.type === "room" && msg.event === "peer-joined") {
-        const newPeerId = msg.peerId;
-
-        if (newPeerId !== myPeerId && haveLocalMedia && !pcs.has(newPeerId)) {
-          await createPeerConnection(newPeerId);
-          await sendOffer(newPeerId);
-        }
-        return;
-      }
-
-      if (msg.type === "offer") {
-        const existingPeerId = msg.fromPeer;
-        log(`received [offer] from peer ${existingPeerId}`);
-
-        if (!pcs.has(existingPeerId)) {
-          await createPeerConnection(existingPeerId);
-          await sendAnswer(existingPeerId, msg.sdp);
-        }
-        return;
-      }
-
-      if (msg.type === "answer") {
-        const existingPeerId = msg.fromPeer;
-        log(`received [answer] from peer ${existingPeerId}`);
-
-        // Get peer connection for this peer
-        const targetPc = pcs.get(existingPeerId);
-        if (targetPc) {
-          await targetPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
-          while (pendingIce.length) {
-            await targetPc.addIceCandidate(pendingIce.shift());
-          }
-        }
-        return;
-      }
-
-      if (msg.type === "ice") {
-        const c = msg.candidate;
-        const existingPeerId = msg.fromPeer;
-
-        // Get peer connection for this peer
-        const targetPc = pcs.get(existingPeerId);
-        if (targetPc) {
-          if (targetPc.remoteDescription) {
-            try {
-              await targetPc.addIceCandidate(c);
-            } catch (e) {}
-          } else {
-            pendingIce.push(c);
-          }
-        } else {
-          pendingIce.push(c);
-        }
-        return;
-      }
-
-      if (msg.type === "bye") {
-        log("peer said bye → closing");
-        await cleanup("peer-bye");
-        return;
-      }
-
-      if (msg.type === "peer-left") {
-        const leftPeerId = msg.peerId;
-        log(
-          `peer ${leftPeerId} left unexpectedly → staying in room, ready for new peer`
-        );
-
-        // Close the specific peer connection and remove its video
-        const leftPc = pcs.get(leftPeerId);
-        if (leftPc) {
-          leftPc.close();
-          pcs.delete(leftPeerId);
-          log(`Closed connection to peer ${leftPeerId}`);
-        }
-
-        // Remove the remote video container for this peer
-        const videoContainer = document.getElementById(
-          `container-${leftPeerId}`
-        );
-        if (videoContainer) {
-          videoContainer.remove();
-        }
-
-        role = msg.newRole || "host";
-        document.getElementById("role").textContent = role;
-        pendingIce = [];
-        iceCandidates = [];
-        activeCandidate = null;
-        document.getElementById("connectionType").textContent = "—";
-        log(
-          `🔄 Ready for new peer to join (waiting for room.ready)... Role: ${role}`
-        );
-        return;
+      switch (msg.type) {
+        case "peer-joined":
+          await handlePeerJoined(msg);
+          break;
+        case "offer":
+          await handleOffer(msg);
+          break;
+        case "answer":
+          await handleAnswer(msg);
+          break;
+        case "ice":
+          await handleIce(msg);
+          break;
       }
     };
+  }
+
+  async function handleIce(msg) {
+    const c = msg.candidate;
+    const existingPeerId = msg.fromPeer;
+
+    // Get peer connection for this peer
+    const targetPc = pcs.get(existingPeerId);
+    if (targetPc) {
+      if (targetPc.remoteDescription) {
+        try {
+          await targetPc.addIceCandidate(c);
+        } catch (e) {}
+      } else {
+        const queue = pendingIce.get(existingPeerId) || [];
+        queue.push(c);
+        pendingIce.set(existingPeerId, queue);
+      }
+    } else {
+      const queue = pendingIce.get(existingPeerId) || [];
+      queue.push(c);
+      pendingIce.set(existingPeerId, queue);
+    }
+  }
+
+  async function handleAnswer(msg) {
+    const existingPeerId = msg.fromPeer;
+    log(`[answer] from peer ${existingPeerId}`);
+
+    // Get peer connection for this peer
+    const targetPc = pcs.get(existingPeerId);
+    if (targetPc) {
+      await targetPc.setRemoteDescription({ type: "answer", sdp: msg.sdp });
+      const queue = pendingIce.get(existingPeerId) || [];
+      while (queue.length) {
+        try {
+          await targetPc.addIceCandidate(queue.shift());
+        } catch (e) {}
+      }
+      pendingIce.set(existingPeerId, queue);
+    }
+  }
+
+  async function handleOffer(msg) {
+    const existingPeerId = msg.fromPeer;
+
+    if (!pcs.has(existingPeerId)) {
+      log(`[offer] from peer ${existingPeerId}`);
+      await createPeerConnection(existingPeerId);
+      await sendAnswer(existingPeerId, msg.sdp);
+    }
+  }
+
+  async function handlePeerJoined(msg) {
+    const peerId = msg.peerId;
+    log(`[peer-joined] from peer ${peerId}`);
+
+    // If this is about me, set my peerId
+    if (!myPeerId) {
+      myPeerId = peerId;
+      document.getElementById("peerId").textContent = myPeerId;
+    }
+
+    // If this is about someone else and I have media, connect to them
+    if (peerId !== myPeerId && haveLocalMedia && !pcs.has(peerId)) {
+      await createPeerConnection(peerId);
+      await sendOffer(peerId);
+    }
   }
 
   async function createPeerConnection(peerId) {
@@ -271,7 +240,6 @@
     if (pc.signalingState === "stable") {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      log(`sending [offer] to peer ${peerId}`);
       send({
         type: "offer",
         sdp: offer.sdp,
@@ -286,12 +254,15 @@
     if (!pc) return;
 
     await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
-    while (pendingIce.length) {
-      await pc.addIceCandidate(pendingIce.shift());
+    const queue = pendingIce.get(peerId) || [];
+    while (queue.length) {
+      try {
+        await pc.addIceCandidate(queue.shift());
+      } catch (e) {}
     }
+    pendingIce.set(peerId, queue);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    log(`sending [answer] to peer ${peerId}`);
     send({
       type: "answer",
       sdp: answer.sdp,
@@ -311,8 +282,6 @@
           const videoContainer = document.createElement("div");
           videoContainer.id = `container-${peerId}`;
           videoContainer.style.position = "relative";
-          videoContainer.style.width = "70%";
-          videoContainer.style.display = "inline-block";
           videoContainer.style.margin = "4px";
 
           // Create peer ID label
@@ -333,22 +302,56 @@
           remoteVideo = document.createElement("video");
           remoteVideo.id = `remote-${peerId}`;
           remoteVideo.playsInline = true;
-          remoteVideo.style.width = "100%";
-          remoteVideo.style.background = "#d5d5d5";
-          remoteVideo.style.aspectRatio = "16/9";
-          remoteVideo.style.borderRadius = "8px";
+          remoteVideo.className = "video-box";
 
-          // Add label and video to container
+          // Create volume control
+          const volumeControl = document.createElement("div");
+          volumeControl.style.position = "absolute";
+          volumeControl.style.bottom = "8px";
+          volumeControl.style.left = "8px";
+          volumeControl.style.right = "8px";
+          volumeControl.style.background = "rgba(0, 0, 0, 0.7)";
+          volumeControl.style.borderRadius = "4px";
+          volumeControl.style.padding = "4px";
+          volumeControl.style.display = "none"; // Hidden by default
+          volumeControl.style.alignItems = "center";
+          volumeControl.style.gap = "8px";
+
+          const volumeLabel = document.createElement("span");
+          volumeLabel.textContent = "🔊";
+          volumeLabel.style.color = "white";
+          volumeLabel.style.fontSize = "12px";
+
+          const volumeSlider = document.createElement("input");
+          volumeSlider.type = "range";
+          volumeSlider.min = "0";
+          volumeSlider.max = "100";
+          volumeSlider.value = "100";
+          volumeSlider.style.flex = "1";
+          volumeSlider.style.height = "4px";
+          volumeSlider.oninput = (e) => {
+            remoteVideo.volume = e.target.value / 100;
+          };
+
+          volumeControl.appendChild(volumeLabel);
+          volumeControl.appendChild(volumeSlider);
+
+          // Add click event to toggle volume controls
+          videoContainer.onclick = () => {
+            const isVisible = volumeControl.style.display !== "none";
+            volumeControl.style.display = isVisible ? "none" : "flex";
+          };
+
+          // Add label, video, and volume control to container
           videoContainer.appendChild(peerLabel);
           videoContainer.appendChild(remoteVideo);
+          videoContainer.appendChild(volumeControl);
 
           const remoteVideosContainer = document.getElementById("remoteVideos");
           remoteVideosContainer.appendChild(videoContainer);
         } else {
         }
 
-        // Always assign or re-assign srcObject to the stream
-        // The MediaStream object itself will update as tracks are added/removed
         remoteVideo.srcObject = stream;
 
         try {
@@ -360,13 +363,6 @@
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        iceCandidates.push({
-          type: e.candidate.type,
-          protocol: e.candidate.protocol,
-          address: e.candidate.address,
-          port: e.candidate.port,
-          candidateType: e.candidate.candidateType || e.candidate.type,
-        });
         send({
           type: "ice",
           candidate: e.candidate,
@@ -381,12 +377,30 @@
         log("✅ Two-way communication established!");
 
         // Log the current pcs Map contents
-        log(`📊 Current pcs Map (${pcs.size} connections):`);
+        log(`Current pcs Map (${pcs.size} connections):`);
         for (const [peerId, pc] of pcs) {
-          log(
-            `  - Peer ${peerId}: ${pc.connectionState} (signaling: ${pc.signalingState})`
-          );
+          log(`  - Peer ${peerId}: ${pc.connectionState} ${pc.signalingState}`);
         }
+      } else if (
+        pc.connectionState === "disconnected" ||
+        pc.connectionState === "failed" ||
+        pc.connectionState === "closed"
+      ) {
+        log(pc.connectionState);
+        log(`❌ Peer ${peerId} disconnected (${pc.connectionState})`);
+
+        // Clean up the peer connection
+        pc.close();
+        pcs.delete(peerId);
+
+        // Remove the remote video
+        const videoContainer = document.getElementById(`container-${peerId}`);
+        if (videoContainer) {
+          videoContainer.remove();
+        }
+
+        // Clean up pending ICE for this peer
+        pendingIce.delete(peerId);
       }
     };
   }
@@ -394,51 +408,40 @@
   async function fetchIceServers() {
     // Get TURN server credentials dynamically using Metered.ca API
     let iceServers = [
-      // STUN servers for NAT traversal (comment out for TURN-only testing)
-      // { urls: "stun:stun.l.google.com:19302" },
-      // { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      {
+        urls: "turn:openrelay.metered.ca:80",
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
+      {
+        urls: "turn:openrelay.metered.ca:443",
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
+      {
+        urls: "turn:openrelay.metered.ca:443?transport=tcp",
+        username: "openrelayproject",
+        credential: "openrelayproject",
+      },
+      {
+        urls: "turn:relay1.expressturn.com:3480",
+        username: "efPU52K4SLOQ34W2QY",
+        credential: "1TJPNFxHKXrZfelz",
+      },
     ];
 
     // Try to get dynamic TURN servers from Metered.ca API
-    try {
-      const response = await fetch(
-        "https://irisa.metered.live/api/v1/turn/credentials?apiKey=6437b90b4a436acebe12a1533600f6eb021f"
-      );
-      const dynamicIceServers = await response.json();
+    const response = await fetch(
+      "https://irisa.metered.live/api/v1/turn/credentials?apiKey=6437b90b4a436acebe12a1533600f6eb021f"
+    );
+    const dynamicIceServers = await response.json();
 
-      // Use all servers from API (both STUN and TURN)
-      iceServers = [...iceServers, ...dynamicIceServers];
-    } catch (e) {
-      // Fallback to static TURN servers
-      iceServers.push(
-        {
-          urls: "turn:openrelay.metered.ca:80",
-          username: "openrelayproject",
-          credential: "openrelayproject",
-        },
-        {
-          urls: "turn:openrelay.metered.ca:443",
-          username: "openrelayproject",
-          credential: "openrelayproject",
-        },
-        {
-          urls: "turn:openrelay.metered.ca:443?transport=tcp",
-          username: "openrelayproject",
-          credential: "openrelayproject",
-        },
-        {
-          urls: "turn:relay1.expressturn.com:3480",
-          username: "efPU52K4SLOQ34W2QY",
-          credential: "1TJPNFxHKXrZfelz",
-        }
-      );
-    }
+    // Use all servers from API (both STUN and TURN)
+    iceServers = [...iceServers, ...dynamicIceServers];
 
     return iceServers;
-  }
-
-  async function bye() {
-    await cleanup("self-bye");
   }
 
   function toggleMute() {
@@ -480,14 +483,12 @@
 
   async function cleanup(tag) {
     if (tag === "self-bye") {
-      send({ type: "bye" });
       try {
         ws?.close();
       } catch {}
       ws = null;
 
       // Reset UI
-      document.getElementById("role").textContent = "—";
       document.getElementById("peerId").textContent = "—";
       document.getElementById("muteBtn").disabled = true;
       document.getElementById("muteBtn").textContent = "Mute Audio";
@@ -507,9 +508,9 @@
       // Clear all remote videos
       const remoteVideosContainer = document.getElementById("remoteVideos");
       remoteVideosContainer.innerHTML = "";
-      role = null;
       myPeerId = null;
-      pendingIce = [];
+      pendingIce.delete(leftPeerId);
+      pendingIce = new Map();
     }
   }
 
@@ -525,9 +526,11 @@
       availableDevices = devices;
 
       const videoDevices = devices.filter(
-        (device) => device.kind === "videoinput"
+        (device) =>
+          device.kind === "videoinput" && !device.label?.includes("Virtual")
       );
       const videoSelect = document.getElementById("videoSelect");
+      videoSelect.innerHTML = "";
 
       videoDevices.forEach((device, index) => {
         const option = document.createElement("option");
@@ -537,8 +540,10 @@
       });
 
       const audioDevices = devices.filter(
-        (device) => device.kind === "audioinput"
+        (device) =>
+          device.kind === "audioinput" && !device.label?.includes("Virtual")
       );
+
       const audioSelect = document.getElementById("audioSelect");
       audioSelect.innerHTML = "";
 
